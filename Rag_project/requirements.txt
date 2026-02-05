@@ -1,0 +1,18 @@
+# [핵심] RTX 5090용 GPU 가속 휠(Wheel)을 가져올 저장소 주소
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+
+# [핵심] NumPy 2.0 충돌 방지를 위해 1.x 버전으로 고정
+numpy<2.0
+
+langchain==0.3.0
+langchain-community==0.3.0
+langchain-huggingface
+langchain-text-splitters
+
+pypdf              # PDF 문서 로드
+sentence-transformers
+llama-cpp-python   # 핵심: 로컬 LLM 구동 엔진
+
+#conda install -c pytorch -c nvidia faiss-gpu=1.8.0 진행 필수
+#faiss-gpu          # GPU로 벡터 검색 가속 (Linux/WSL) 또는 faiss-cpu (Windows)
+# pip install --no-cache-dir -r requirements.txt 캐시 없이 설치
