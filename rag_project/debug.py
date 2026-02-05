@@ -1,21 +1,21 @@
 import sys
 import os
 
-print(f"🐍 Python Executable: {sys.executable}")
-print(f"📂 Current Working Directory: {os.getcwd()}")
+print(f"Python Executable: {sys.executable}")
+print(f"Current Working Directory: {os.getcwd()}")
 
-print("\n🔍 'langchain' 모듈 위치 찾는 중...")
+print("\n'langchain' 모듈 위치 찾는 중...")
 try:
     import langchain
-    print(f"✅ langchain found at: {langchain.__file__}")
-    print(f"ℹ️ langchain version: {langchain.__version__}")
+    print(f"langchain found at: {langchain.__file__}")
+    print(f"langchain version: {langchain.__version__}")
 except ImportError:
-    print("'langchain' 모듈 자체를 찾을 수 없습니다.")
+    print("langchain 모듈 자체를 찾을 수 없습니다.")
 except AttributeError:
     # langchain이 파일이 아니라 폴더(Namespace)로 인식될 때
-    print(f"⚠️ langchain found (namespace pkg): {langchain.__path__}")
+    print(f"langchain found (namespace pkg): {langchain.__path__}")
 
-print("\n🔍 'langchain.chains' 위치 찾는 중...")
+print("\n'langchain.chains' 위치 찾는 중...")
 try:
     import langchain.chains
     print(f"langchain.chains found at: {langchain.chains.__file__}")
@@ -33,4 +33,4 @@ except ImportError as e:
         print(f"\n[발견] 현재 폴더에 '{local_folder}' 폴더가 있습니다.")
         print("이 폴더 이름을 바꾸거나 지우세요.")
     else:
-        print("\n🤔 로컬 파일 충돌은 아닙니다. 패키지 설치 상태를 의심해야 합니다.")
+        print("\n 로컬 파일 충돌은 아닙니다. 패키지 설치 상태를 의심해야 합니다.")

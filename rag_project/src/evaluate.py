@@ -1,198 +1,193 @@
 import os
+import re
 import numpy as np
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain_huggingface import HuggingFaceEmbeddings
-
-# 기존 RAG 엔진 가져오기
 from rag_engine import get_rag_chain, get_llm
 
-# NLTK 데이터 다운로드 (최초 1회 필요)
+# NLTK 데이터 확인
 try:
     nltk.data.find('tokenizers/punkt')
+    nltk.data.find('tokenizers/punkt_tab')
 except LookupError:
     nltk.download('punkt')
+    nltk.download('punkt_tab')
 
 # ==========================================
-# 1. 평가용 데이터셋 (Ground Truth)
+# 평가 데이터셋 설정
+# 주의: Recall@k와 MRR을 측정하려면 'relevant_docs'에 정답 파일명을 적어야 합니다.
 # ==========================================
-# 실제 평가할 때는 이 내용을 엑셀에서 불러오거나 더 늘려야 합니다.
 EVAL_DATASET = [
     {
         "question": "건설 현장에서 추락 사고 예방을 위한 조치는?",
-        "ground_truth": "추락 사고 예방을 위해 안전난간 설치, 추락 방호망 설치, 그리고 작업자 안전대 착용이 필수적입니다."
+        "ground_truth": "안전난간 설치, 추락 방호망 설치, 안전대 착용이 필수적입니다.",
+        "relevant_docs": ["소규모 건설공사 안전관리 매뉴얼(2023).pdf"] # 정답이 포함된 실제 파일명
     },
     {
-        "question": "안전관리비의 사용 가능 항목은 무엇인가요?",
-        "ground_truth": "안전관리자 인건비, 안전 시설비, 개인 보호구 구매비, 안전 교육비 등이 포함됩니다."
+        "question": "안전관리비의 사용 가능 항목은?",
+        "ground_truth": "안전관리자 인건비, 안전 시설비, 개인 보호구 구매비 등이 포함됩니다.",
+        "relevant_docs": ["건설공사 안전관리계획서 작성 매뉴얼.pdf"]
     }
 ]
-
-# ==========================================
-# 2. 평가 지표 계산 함수들
-# ==========================================
 
 class RAGEvaluator:
     def __init__(self):
         print("평가 시스템 초기화 중...")
         self.rag_chain = get_rag_chain()
-        self.llm = get_llm() # 심사위원(Judge)으로 사용할 LLM
-        
-        # 의미적 유사도 계산을 위한 임베딩 모델 (기존과 동일한 것 사용)
+        self.llm = get_llm()
         self.embedding_model = HuggingFaceEmbeddings(
             model_name="jhgan/ko-sroberta-multitask",
-            model_kwargs={'device': 'cuda'} # GPU 사용
+            model_kwargs={'device': 'cuda'}
         )
 
-    def calculate_bleu(self, generated_text, reference_text):
-        """BLEU 점수 계산 (단어 일치도)"""
+    def parse_score(self, response_text):
+        """LLM 답변에서 0 또는 1만 추출"""
+        numbers = re.findall(r'\b[0-1]\b', response_text)
+        if numbers:
+            return int(numbers[0])
+        return 0
+
+    def calculate_metrics(self, generated_text, reference_text):
+        # 1. BLEU
         ref_tokens = nltk.word_tokenize(reference_text)
         gen_tokens = nltk.word_tokenize(generated_text)
-        # SmoothingFunction은 짧은 문장에서 점수가 0이 되는 것을 방지
-        score = sentence_bleu([ref_tokens], gen_tokens, smoothing_function=SmoothingFunction().method1)
-        return score
+        bleu = sentence_bleu([ref_tokens], gen_tokens, smoothing_function=SmoothingFunction().method1)
+        
+        # 2. Semantic Similarity
+        emb = self.embedding_model.embed_documents([generated_text, reference_text])
+        sim = cosine_similarity([emb[0]], [emb[1]])[0][0]
+        
+        return bleu, sim
 
-    def calculate_semantic_similarity(self, generated_text, reference_text):
-        """의미적 유사도 (코사인 유사도)"""
-        embeddings = self.embedding_model.embed_documents([generated_text, reference_text])
-        score = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
-        return score
-
-    def evaluate_with_llm(self, prompt_text):
-        """LLM에게 점수를 매기게 하는 함수"""
+    def evaluate_llm_metric(self, prompt_text):
         try:
             response = self.llm.invoke(prompt_text)
-            # 답변에서 숫자만 추출 (예: "점수는 5점입니다" -> 5)
-            import re
-            numbers = re.findall(r'\d+', response)
-            if numbers:
-                return int(numbers[0])
-            else:
-                return 0 # 파싱 실패 시 0점 처리
-        except Exception as e:
-            print(f" LLM 평가 중 오류: {e}")
+            return self.parse_score(response)
+        except:
             return 0
 
-    def calculate_faithfulness(self, context, answer):
-        """Faithfulness: 답변이 문서에 있는 내용으로만 작성되었는가?"""
-        prompt = f"""
-        당신은 공정한 평가자입니다. 아래 [참고 문서]와 [AI 답변]을 읽고 평가하세요.
-        
-        [참고 문서]:
-        {context}
-        
-        [AI 답변]:
-        {answer}
-        
-        평가 기준:
-        - AI 답변이 [참고 문서]에 있는 내용에 기반하고 있으면 1점
-        - 문서에 없는 내용을 지어냈으면 0점
-        
-        결과를 0 또는 1 숫자 하나로만 답하세요.
-        """
-        return self.evaluate_with_llm(prompt)
-
-    def calculate_truthfulness(self, ground_truth, answer):
-        """Truthfulness: 정답(Ground Truth)과 비교했을 때 사실 관계가 맞는가?"""
-        prompt = f"""
-        당신은 건설 전문가입니다. [정답]과 [AI 답변]을 비교하여 정확성을 평가하세요.
-        
-        [정답]:
-        {ground_truth}
-        
-        [AI 답변]:
-        {answer}
-        
-        평가 기준:
-        - AI 답변이 정답의 핵심 내용을 모두 포함하고 정확하면 1점
-        - 틀린 내용이 있거나 핵심이 빠졌으면 0점
-        
-        결과를 0 또는 1 숫자 하나로만 답하세요.
-        """
-        return self.evaluate_with_llm(prompt)
-
-    def calculate_context_recall(self, context, ground_truth):
-        """Context Recall: 검색된 문서 안에 정답을 맞힐 수 있는 정보가 있었는가?"""
-        prompt = f"""
-        [참고 문서] 안에 [정답]을 유추할 수 있는 정보가 포함되어 있는지 확인하세요.
-        
-        [참고 문서]:
-        {context}
-        
-        [정답]:
-        {ground_truth}
-        
-        평가 기준:
-        - 문서만 보고 정답을 맞힐 수 있으면 1점
-        - 문서에 관련 내용이 없으면 0점
-        
-        결과를 0 또는 1 숫자 하나로만 답하세요.
-        """
-        return self.evaluate_with_llm(prompt)
-
     # ==========================================
-    # 3. 전체 평가 실행
+    # 신규 추가: 검색 성능 지표 (Recall@k, MRR)
     # ==========================================
+    def calculate_retrieval_metrics(self, retrieved_docs, relevant_docs_list):
+        if not relevant_docs_list:
+            return 0.0, 0.0
+
+        # 검색된 문서들의 파일명(source) 추출
+        # 경로가 포함되어 있을 수 있으므로 파일명만 추출해서 비교하거나 부분 일치 확인
+        retrieved_sources = [os.path.basename(doc.metadata.get('source', '')) for doc in retrieved_docs]
+        
+        # 1. Recall@k 계산
+        hits = 0
+        for true_doc in relevant_docs_list:
+            for ret_doc in retrieved_sources:
+                if true_doc in ret_doc: # 부분 일치 허용
+                    hits += 1
+                    break
+        recall_at_k = hits / len(relevant_docs_list)
+
+        # 2. MRR 계산
+        mrr = 0.0
+        for rank, ret_doc in enumerate(retrieved_sources):
+            for true_doc in relevant_docs_list:
+                if true_doc in ret_doc:
+                    mrr = 1.0 / (rank + 1)
+                    return recall_at_k, mrr # 첫 번째 정답 발견 시 종료
+        
+        return recall_at_k, mrr
+
     def run_evaluation(self, dataset):
-        print(f"\n총 {len(dataset)}개의 질문에 대해 평가를 시작합니다...\n")
+        print(f"\n총 {len(dataset)}개의 질문 평가 시작...\n")
         
+        # 결과 저장소
         results = {
-            "bleu": [],
-            "semantic_similarity": [],
-            "faithfulness": [],
-            "truthfulness": [],
-            "context_recall": []
+            "bleu": [], "sem_sim": [], 
+            "faith": [], "truth": [], "ctx_recall_llm": [],
+            "recall_k": [], "mrr": []
         }
 
         for i, data in enumerate(dataset):
-            question = data["question"]
-            ground_truth = data["ground_truth"]
+            q = data["question"]
+            gt = data["ground_truth"]
+            targets = data.get("relevant_docs", []) # 정답 파일명 리스트
             
-            print(f"[{i+1}/{len(dataset)}] 질문 처리 중: {question}")
+            print(f"[{i+1}] 질문: {q}")
+            
+            # RAG 실행
+            res = self.rag_chain.invoke(q)
+            ans = res['result']
+            docs = res['source_documents'] # 검색된 문서들
+            
+            # 검색된 문서 텍스트 합치기 (LLM 평가용)
+            ctx_text = "\n".join([d.page_content[:200] for d in docs])
 
-            # 1. RAG 실행
-            response = self.rag_chain.invoke(question)
-            generated_answer = response['result']
+            # ---------------------------
+            # 1. 생성 성능 평가 (답변 품질)
+            # ---------------------------
+            bleu, sim = self.calculate_metrics(ans, gt)
             
-            # 검색된 문서 내용 합치기
-            retrieved_docs = response['source_documents']
-            context_text = "\n".join([doc.page_content for doc in retrieved_docs])
+            # Faithfulness
+            p_faith = f"""
+            [문서]를 보고 [답변]이 사실인지 판단하세요.
+            문서에 있는 내용이면 1, 없는 내용을 지어냈으면 0을 출력하세요. 설명은 하지 마세요.
+            [문서]: {ctx_text}
+            [답변]: {ans}
+            점수(0 또는 1):"""
+            faith = self.evaluate_llm_metric(p_faith)
 
-            # 2. 지표 계산
-            # (1) BLEU
-            bleu = self.calculate_bleu(generated_answer, ground_truth)
-            
-            # (2) Semantic Similarity
-            sem_sim = self.calculate_semantic_similarity(generated_answer, ground_truth)
-            
-            # (3) Faithfulness (환각 여부)
-            faith = self.calculate_faithfulness(context_text, generated_answer)
-            
-            # (4) Truthfulness (정답 일치 여부)
-            truth = self.calculate_truthfulness(ground_truth, generated_answer)
-            
-            # (5) Context Recall (검색 품질)
-            recall = self.calculate_context_recall(context_text, ground_truth)
+            # Truthfulness
+            p_truth = f"""
+            [정답]과 비교하여 [답변]이 정확한지 판단하세요.
+            핵심 내용이 맞으면 1, 틀리면 0을 출력하세요. 설명은 하지 마세요.
+            [정답]: {gt}
+            [답변]: {ans}
+            점수(0 또는 1):"""
+            truth = self.evaluate_llm_metric(p_truth)
+
+            # LLM Context Recall (답변 가능 여부)
+            p_ctx_recall = f"""
+            [문서] 안에 [정답]에 대한 내용이 포함되어 있나요?
+            있으면 1, 없으면 0을 출력하세요.
+            [문서]: {ctx_text}
+            [정답]: {gt}
+            점수(0 또는 1):"""
+            ctx_recall = self.evaluate_llm_metric(p_ctx_recall)
+
+            # ---------------------------
+            # 2. 검색 성능 평가 (Recall@k, MRR)
+            # ---------------------------
+            recall_k, mrr = self.calculate_retrieval_metrics(docs, targets)
 
             # 결과 저장
             results["bleu"].append(bleu)
-            results["semantic_similarity"].append(sem_sim)
-            results["faithfulness"].append(faith)
-            results["truthfulness"].append(truth)
-            results["context_recall"].append(recall)
+            results["sem_sim"].append(sim)
+            results["faith"].append(faith)
+            results["truth"].append(truth)
+            results["ctx_recall_llm"].append(ctx_recall)
+            results["recall_k"].append(recall_k)
+            results["mrr"].append(mrr)
 
-            print(f"   -> BLEU: {bleu:.4f} | Sim: {sem_sim:.4f} | Faith: {faith} | Truth: {truth} | Recall: {recall}")
+            # 개별 결과 출력 (이모지 제거)
+            print(f"   -> 답변: {ans[:30]}...")
+            print(f"   -> 생성지표: Sim={sim:.2f}, Faith={faith}, Truth={truth}")
+            print(f"   -> 검색지표: Recall@k={recall_k:.2f}, MRR={mrr:.2f}")
 
-        # 평균 점수 출력
+        # 최종 리포트 출력
         print("\n" + "="*40)
         print("최종 평가 리포트")
         print("="*40)
-        print(f"1. BLEU (단어 일치도)      : {np.mean(results['bleu']):.4f}")
-        print(f"2. Sem Sim (의미 유사도)   : {np.mean(results['semantic_similarity']):.4f}")
-        print(f"3. Faithfulness (신뢰성)   : {np.mean(results['faithfulness']):.2f} / 1.0")
-        print(f"4. Truthfulness (정확성)   : {np.mean(results['truthfulness']):.2f} / 1.0")
-        print(f"5. Context Recall (검색력) : {np.mean(results['context_recall']):.2f} / 1.0")
+        print("[생성 품질 지표]")
+        print(f"BLEU Score        : {np.mean(results['bleu']):.4f} (참고용)")
+        print(f"Semantic Sim      : {np.mean(results['sem_sim']):.4f} (목표: 0.7 이상)")
+        print(f"Faithfulness      : {np.mean(results['faith']):.2f} (목표: 0.9 이상)")
+        print(f"Truthfulness      : {np.mean(results['truth']):.2f} (목표: 0.8 이상)")
+        print("-" * 40)
+        print("[검색 품질 지표]")
+        print(f"Context Recall(LLM): {np.mean(results['ctx_recall_llm']):.2f} (답변 가능성)")
+        print(f"Recall@k (Retrieval): {np.mean(results['recall_k']):.2f} (문서 발견율)")
+        print(f"MRR                 : {np.mean(results['mrr']):.4f} (상위 노출도)")
         print("="*40)
 
 if __name__ == "__main__":

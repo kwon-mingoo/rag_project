@@ -5,7 +5,6 @@ from langchain.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# [수정] 복잡한 계산 없이 그냥 경로를 적습니다.
 # 주의: 이 코드는 'rag_project' 폴더 안에서 실행해야 작동합니다.
 MODEL_PATH = "./models/Meta-Llama-3.1-8B-Instruct.Q8_0.gguf"
 DB_PATH = "./vector_db"
@@ -13,15 +12,18 @@ DB_PATH = "./vector_db"
 def get_llm():
     llm = LlamaCpp(
         model_path=MODEL_PATH,
-        n_gpu_layers=-1,        # 8B 모델 100% GPU 구동
-        n_batch=512,
-        n_ctx=8192,
-        f16_kv=True,
-        verbose=True,
-        temperature=0.1,        # RAG용 정직한 답변
-        top_p=0.9,
-        repeat_penalty=1.2,     # 반복 방지
-        stop=["[질문]:", "Question:", "\n\n", "User:", "---"]
+        # 성능
+        n_gpu_layers=-1,        # 모든 연산을 GPU로 처리 (속도 최적화)
+        n_batch=512,            # 한 번에 처리할 데이터 양
+        n_ctx=8192,             # 최대 문맥 길이 (질문+문서+답변)
+        f16_kv=True,            # 메모리 절약 (성능 유지)
+        verbose=True,           # 실행 로그 출력
+
+        # 답변 스타일
+        temperature=0.1,        # 창의성 억제 (사실 위주 답변)
+        top_p=0.9,              # 뚱딴지같은 단어 방지
+        repeat_penalty=1.2,     # 같은 말 반복 금지
+        stop=["[질문]:", "Question:", "\n\n", "User:", "---"] # 답변 끝나면 즉시 멈춤
     )
     return llm
 
@@ -35,7 +37,7 @@ def get_rag_chain():
     )
     
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"벡터 DB가 안 보입니다. 혹시 src 폴더 안에서 실행하셨나요?")
+        raise FileNotFoundError(f"벡터 DB가 안 보임.")
 
     vector_db = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
     retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
