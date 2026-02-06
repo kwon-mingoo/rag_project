@@ -16,6 +16,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 MODEL_PATH = os.path.join(project_root, "models","Llama","Meta-Llama-3.1-8B-Instruct.Q8_0.gguf")
+#MODEL_PATH = os.path.join(project_root, "models","Qwen72b","qwen2.5-72b-instruct-q4_k_m-00001-of-00012.gguf")
 DB_PATH = os.path.join(project_root, "vector_db")
 DATA_PATH = os.path.join(project_root, "data") # 원본 문서 경로
 
@@ -90,7 +91,7 @@ def get_rag_chain():
         # 건설 용어가 중요하다면 BM25 비중을 0.6~0.7로 높여도 좋습니다.
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, faiss_retriever],
-            weights=[0.5, 0.5]
+            weights=[0.4, 0.6]   # left: keyword, right: context
         )
         final_retriever = ensemble_retriever
         print("Hybrid Search(BM25 + FAISS)가 적용되었습니다.")
