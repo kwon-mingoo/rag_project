@@ -1,4 +1,8 @@
 models/
 data/
 .env
+data_before/
+data_eval/
+eval_data/
+models/
 
