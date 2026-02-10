@@ -1,0 +1,9 @@
+{
+  "docs_dir": "/home/nami/Desktop/rag_project_v1/data",
+  "vectordb_dir": "VectorDB",
+  "embedding_model": "BAAI/bge-m3",
+  "chunk_size": 900,
+  "chunk_overlap": 150,
+  "batch_size": 64,
+  "nlist": 0
+}

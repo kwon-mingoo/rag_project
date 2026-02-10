@@ -1,29 +1,18 @@
-#[GPU 가속] RTX 5090용 Llama-cpp-python (CUDA 12.4)
-
+# [핵심] RTX 5090용 GPU 가속 휠(Wheel)을 가져올 저장소 주소
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 
-#1. 핵심 라이브러리 (버전 호환성 유지)
-
+# [핵심] NumPy 2.0 충돌 방지를 위해 1.x 버전으로 고정
 numpy<2.0
-
-#2. LangChain 프레임워크
 
 langchain==0.3.0
 langchain-community==0.3.0
 langchain-huggingface
 langchain-text-splitters
 
-#3. LLM 및 RAG 엔진
-
-llama-cpp-python
-pypdf
+pypdf              # PDF 문서 로드
 sentence-transformers
-rank_bm25           # Hybrid Search(키워드 검색)용 라이브러리
-# faiss-gpu  # (참고: 만약 pip로 안 깔리면 conda install faiss-gpu 권장)
+llama-cpp-python   # 핵심: 로컬 LLM 구동 엔진
 
-
-#4. 평가(Evaluation)용 라이브러리
-
-nltk
-scikit-learn
-rouge-score
+#conda install -c pytorch -c nvidia faiss-gpu=1.8.0 진행 필수
+#faiss-gpu          # GPU로 벡터 검색 가속 (Linux/WSL) 또는 faiss-cpu (Windows)
+# pip install --no-cache-dir -r requirements.txt 캐시 없이 설치
