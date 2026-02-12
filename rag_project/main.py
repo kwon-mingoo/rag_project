@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py
+main.py (fixed)
 - 운영 진입점: VectorDB 없으면 build_vectordb.py 실행 → 이후 대화형 질의(RAG)
-- src/evaluate.py의 로직을 그대로 재사용 (BM25+FAISS+llama.cpp)
+- rag_engine_fixed.py 사용 (evaluate.py 통합 전과 동일한 retrieval/prompt 재현)
 
 사용 예)
-  python main.py
-  python main.py --show_topk
-  python main.py --alpha 0.6 --top_k 8
+  python main_fixed.py
+  python main_fixed.py --show_topk
+  python main_fixed.py --alpha 0.6 --top_k 8
 """
 
 import os
@@ -20,10 +20,13 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 VDB_DIR = os.path.join(ROOT_DIR, "VectorDB")
 
+# rag_engine_fixed.py는 src/에 두거나, main과 같은 폴더에 둔 뒤 sys.path에 추가하세요.
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-import evaluate as ev  # noqa: E402
+import rag_engine_fixed as eng  # noqa: E402
 
 
 def vectordb_ready(vdb_dir: str) -> bool:
@@ -61,8 +64,10 @@ def main():
     else:
         print("VectorDB 확인 완료")
 
-    # 2) 공통 리소스 1회 로딩 (모델/인덱스 재로딩 방지)
-    cfg = ev.EvalConfig()
+    # 2) 공통 리소스 1회 로딩
+    cfg = eng.RAGConfig()
+    cfg.vectordb_dir = VDB_DIR
+
     if args.alpha is not None:
         cfg.alpha = float(args.alpha)
     if args.top_k is not None:
@@ -70,10 +75,9 @@ def main():
     if args.fetch_k is not None:
         cfg.fetch_k = int(args.fetch_k)
 
-    index, docs, bm25 = ev.load_vectordb(cfg.vectordb_dir)
-    embed_model = ev.SentenceTransformer(cfg.embedding_model)
-    llm = ev.build_llama(cfg)
-    retriever = ev.HybridRetriever(docs, bm25, index, embed_model)
+    res = eng.load_resources(cfg)
+    retriever = eng.HybridRetriever(res.docs, res.bm25, res.index, res.embed_model)
+    llm = eng.build_llama(cfg)
 
     print("\n" + "=" * 90)
     print("RAG 질의 모드입니다. 종료하려면 exit/quit 입력")
@@ -93,7 +97,7 @@ def main():
             break
 
         retrieved = retriever.retrieve(q, cfg.alpha, cfg.top_k, cfg.fetch_k)
-        context_blocks = ev.make_context_blocks(retrieved)
+        context_blocks = eng.make_context_blocks(retrieved)
 
         if args.show_topk:
             print("\n[TOP-K Retrieved]")
@@ -107,13 +111,14 @@ def main():
             print("\n[CONTEXT BLOCKS]\n")
             print(context_blocks)
 
-        user_prompt = ev.build_user_prompt(q, context_blocks)
-        answer = ev.llama_chat(
+        user_prompt = eng.build_user_prompt(q, context_blocks)
+        answer = eng.llama_chat(
             llm,
-            ev.SYSTEM_PROMPT,
+            eng.SYSTEM_PROMPT,
             user_prompt,
             max_tokens=cfg.max_tokens,
             temperature=cfg.temperature,
+            top_p=cfg.top_p,
         )
 
         print("\n" + "-" * 90)

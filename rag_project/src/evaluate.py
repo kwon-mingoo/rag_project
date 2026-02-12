@@ -1,962 +1,511 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+evaluate.py
+- rag_engine.py를 사용해 "동일한 검색/생성 로직"으로 평가합니다.
+
+지표:
+(Generation)
+- BLEU
+- Semantic Similarity (cosine on embeddings)
+- Faithfulness (LLM judge, 0~1)
+- Truthfulness (LLM judge, 0~1)
+
+(Retrieval)
+- Context Recall (LLM judge, 0~1)
+- Recall@k
+- MRR
+
+입력 CSV: eval_data/*.csv (기본: eval_data/eval_dataset_rag_queries.csv)
+출력 JSON: eval_data/eval_report.json
+"""
+
 import os
-import glob
+import re
 import json
 import argparse
-import pickle
-import re
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple, Optional, Set
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
-from langchain_core.documents import Document
-from sentence_transformers import SentenceTransformer
-from rank_bm25 import BM25Okapi
-from langchain_community.llms import LlamaCpp
-from llama_cpp import Llama
-
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
-try:
-    import faiss
-except ImportError as e:
-    raise ImportError("FAISS가 필요합니다. (pip faiss-cpu) 또는 (conda faiss-gpu)") from e
+from sentence_transformers import SentenceTransformer
 
-
-
-# -----------------------------
-# System/User Prompts (운영형 템플릿)
-# -----------------------------
-SYSTEM_PROMPT = """당신은 건설 현장 RAG 기반 ‘법령/기준 근거 제시’ 어시스턴트입니다.
-
-원칙:
-- 제공된 [컨텍스트]에 있는 내용만 근거로 답변합니다.
-- 컨텍스트에 없는 법령/조항/수치/요구사항은 추측하지 않습니다.
-- 모든 요구사항/권고사항은 반드시 출처([1],[2]...)를 붙입니다.
-- 근거가 부족하면 '근거 부족'으로 표시하고 추가 확인이 필요한 정보를 질문합니다.
-
-출력 형식은 반드시 지정된 템플릿을 따릅니다.
-"""
-
-def build_user_prompt(question: str, context_blocks: str) -> str:
-    return f"""[질의]
-{question}
-
-[컨텍스트]
-{context_blocks}
-
-[출력 템플릿]
-## 1) 결론(한 줄)
-- (핵심 요구사항 1문장) [출처]
-
-## 2) 적용해야 할 요구사항(필수)
-- 요구사항 A: … [출처]
-- 요구사항 B: … [출처]
-
-## 3) 근거(법령/기준/가이드)
-- 근거 1: 문서명 p.페이지 (요약) [출처]
-- 근거 2: 문서명 p.페이지 (요약) [출처]
-
-## 4) 현장 실행 체크리스트(권고)
-- [ ] 작업 전: … [출처]
-- [ ] 작업 중: … [출처]
-- [ ] 작업 후: … [출처]
-- [ ] 문서/기록: … [출처]
-
-## 5) 계획변경/민원 대응 시 리스크와 권고
-- 리스크: … [출처 또는 근거부족]
-- 권고: … [출처 또는 근거부족]
-
-## 6) 근거 부족/추가 확인 질문
-- (컨텍스트만으로 판단 불가한 항목을 질문 형태로 3개 이내)
-"""
-
-# -----------------------------
-# Tokenizer (BM25용)
-# -----------------------------
-_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9가-힣_]+")
-
-def tokenize_ko_en(text: str) -> List[str]:
-    return _TOKEN_PATTERN.findall(str(text).lower())
-
-
-def minmax_norm(x: np.ndarray) -> np.ndarray:
-    if x.size == 0:
-        return x
-    mn = float(x.min())
-    mx = float(x.max())
-    if abs(mx - mn) < 1e-9:
-        return np.zeros_like(x, dtype=np.float32)
-    return ((x - mn) / (mx - mn)).astype(np.float32)
+import rag_engine as eng
 
 
 # -----------------------------
-# Config
+# Eval Config (확장: judge 옵션, 저장 옵션)
 # -----------------------------
 @dataclass
 class EvalConfig:
-    vectordb_dir: str = "VectorDB"
-    eval_data_dir: str = "/home/nami/Desktop/rag_project_v1/eval_data/eval_dataset_rag_queries.csv"
-    out_report: str = "eval_data/eval_report.json"
+    # paths
+    eval_csv: str = "eval_data/eval_dataset_rag_queries.csv"
+    report_path: str = "eval_data/eval_report.json"
+    save_jsonl: str = "eval_data/retrieval_debug.jsonl"
 
-    # Models
-    embedding_model: str = "BAAI/bge-m3"
-    gguf_path: str = "/home/nami/Desktop/rag_project_v1/models/llama8b/Meta-Llama-3.1-8B-Instruct.Q8_0.gguf"
+    # reuse RAGConfig fields
+    rag: eng.RAGConfig = field(default_factory=eng.RAGConfig)
 
-    # Hybrid retrieval
-    alpha: float = 0.55
-    top_k: int = 6
-    fetch_k: int = 40
+    # evaluation behavior
+    max_rows: int = -1
+    debug_n: int = 0
+    retrieval_only: bool = False
+    enable_judge: bool = True  # faith/truth/ctxrecall
 
-    # LLM generation + judging
-    n_ctx: int = 8192
-    n_gpu_layers: int = -1
-    temperature: float = 0.2
-    max_tokens: int = 1024
+    # judge settings (same model by default)
+    judge_max_tokens: int = 2048   # 평가 토큰 수
+    judge_temperature: float = 0.0 # 평가 랜덤성 조절   
 
-    # Judge settings
-    judge_max_tokens: int = 1024
-    judge_temperature: float = 0.0
-
-    # BLEU settings
-    bleu_max_ngram: int = 4  # BLEU-4
-
-    # Semantic similarity score mapping
-    # cosine(-1..1) -> (0..1) via (cos+1)/2 then clamp
+    # metric settings (통합 전 evaluate.py와 동일하게 맞추기)
+    bleu_max_ngram: int = 4
     semantic_map_to_01: bool = True
 
 
-# -----------------------------
-# Load VectorDB
-# -----------------------------
-def load_vectordb(vectordb_dir: str):
-    faiss_path = os.path.join(vectordb_dir, "faiss.index")
-    docs_path = os.path.join(vectordb_dir, "docs.pkl")
-    bm25_path = os.path.join(vectordb_dir, "bm25.pkl")
-
-    if not (os.path.exists(faiss_path) and os.path.exists(docs_path) and os.path.exists(bm25_path)):
-        raise FileNotFoundError("VectorDB가 완전하지 않습니다. 먼저 src/build_vectordb.py 실행하세요.")
-
-    index = faiss.read_index(faiss_path)
-    with open(docs_path, "rb") as f:
-        docs = pickle.load(f)
-    with open(bm25_path, "rb") as f:
-        bm = pickle.load(f)
-    bm25: BM25Okapi = bm["bm25"]
-    return index, docs, bm25
-
-
-# -----------------------------
-# Hybrid Retriever
-# -----------------------------
-class HybridRetriever:
-    def __init__(self, docs: List[Document], bm25: BM25Okapi, faiss_index, embed_model: SentenceTransformer):
-        self.docs = docs
-        self.bm25 = bm25
-        self.index = faiss_index
-        self.embed_model = embed_model
-
-    def embed_query(self, q: str) -> np.ndarray:
-        v = self.embed_model.encode([q], convert_to_numpy=True, normalize_embeddings=False).astype("float32")
-        faiss.normalize_L2(v)
-        return v
-
-    def retrieve(self, query: str, alpha: float, top_k: int, fetch_k: int) -> List[Tuple[Document, float, Dict[str, Any]]]:
-        # BM25
-        q_tokens = tokenize_ko_en(query)
-        bm25_scores = np.array(self.bm25.get_scores(q_tokens), dtype=np.float32)
-        bm25_n = minmax_norm(bm25_scores)
-
-        # FAISS
-        qv = self.embed_query(query)
-        sim, idx = self.index.search(qv, fetch_k)
-        sim = sim[0].astype(np.float32)
-        idx = idx[0].astype(np.int64)
-
-        vec_scores = np.zeros(len(self.docs), dtype=np.float32)
-        vec_scores[idx] = sim
-        vec_n = minmax_norm(vec_scores)
-
-        # Hybrid
-        hybrid = alpha * vec_n + (1.0 - alpha) * bm25_n
-        top_idx = np.argsort(-hybrid)[:top_k]
-
-        results = []
-        for rank_i, i in enumerate(top_idx, start=1):
-            d = self.docs[i]
-            dbg = {
-                "rank": rank_i,
-                "hybrid": float(hybrid[i]),
-                "bm25": float(bm25_scores[i]),
-                "vec": float(vec_scores[i]),
-                "chunk_id": d.metadata.get("chunk_id"),
-                "source": d.metadata.get("source"),
-                "page": d.metadata.get("page"),
-                "source_basename": os.path.basename(str(d.metadata.get("source", ""))),
-            }
-            results.append((d, float(hybrid[i]), dbg))
-        return results
-
-
-# -----------------------------
-# LLM (generation + judge)
-# -----------------------------
-
-# -----------------------------
-# llama.cpp direct (stable for Llama 3.1)
-# -----------------------------
-def build_llama(cfg: EvalConfig) -> Llama:
-    if not os.path.exists(cfg.gguf_path):
-        raise FileNotFoundError(f"GGUF 파일이 없습니다: {cfg.gguf_path}")
-    return Llama(
-        model_path=cfg.gguf_path,
-        n_ctx=cfg.n_ctx,
-        n_gpu_layers=cfg.n_gpu_layers,
-        n_batch=512,
-        verbose=False,
-    )
-
-def llama_chat(llm: Llama, system: str, user: str, max_tokens: int, temperature: float, top_p: float = 0.9) -> str:
-    out = llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-    )
-    return out["choices"][0]["message"]["content"]
-
-def llama_judge(llm: Llama, user_prompt: str, max_tokens: int = 512) -> str:
-    # Strict JSON judge: system is fixed to minimize chatter.
-    system = "You are a strict evaluator. Output ONLY valid JSON. Do not include markdown or explanations."
-    out = llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=max_tokens,
-    )
-    return out["choices"][0]["message"]["content"]
-
-def build_llm(cfg: EvalConfig) -> LlamaCpp:
-    if not os.path.exists(cfg.gguf_path):
-        raise FileNotFoundError(f"GGUF 파일이 없습니다: {cfg.gguf_path}")
-
-    return LlamaCpp(
-        model_path=cfg.gguf_path,
-        n_ctx=cfg.n_ctx,
-        n_gpu_layers=cfg.n_gpu_layers,
-        n_batch=512,
-        temperature=cfg.temperature,
-        top_p=0.9,
-        repeat_penalty=1.12,
-        max_tokens=cfg.max_tokens,
-        # Llama 3.1 Instruct는 chat template 필수
-        chat_format="llama-3",
-        stop=["<|eot_id|>"],
-        verbose=False,
-    )
-
-
-def build_judge(cfg: EvalConfig) -> LlamaCpp:
-    return LlamaCpp(
-        model_path=cfg.gguf_path,
-        n_ctx=cfg.n_ctx,
-        n_gpu_layers=cfg.n_gpu_layers,
-        n_batch=512,
-        temperature=0.0,
-        top_p=1.0,
-        repeat_penalty=1.05,
-        max_tokens=512,
-        chat_format="llama-3",
-        stop=["<|eot_id|>"],
-        verbose=False,
-    )
-
-
-def make_context_blocks(retrieved: List[Tuple[Document, float, Dict[str, Any]]]) -> str:
-    blocks = []
-    for i, (d, _, dbg) in enumerate(retrieved, start=1):
-        src = d.metadata.get("source", "unknown")
-        page = d.metadata.get("page", None)
-        where = f"{os.path.basename(str(src))}" + (f" p.{page}" if page is not None else "")
-        blocks.append(f"[{i}] ({where}, chunk_id={d.metadata.get('chunk_id')})\n{d.page_content}")
-    return "\n\n".join(blocks)
-
-
-def build_user_input(question: str, context_blocks: str) -> str:
-    # User message: include question + context + output constraints
-    return f"""질문:\n{question}\n\n컨텍스트:\n{context_blocks}\n\n요청:\n- 반드시 컨텍스트 근거로만 답변\n- 가능하면 [1],[2] 출처 표시\n"""
-
-
-def gen_prompt(question: str, context_blocks: str) -> str:
-    return f"""당신은 문서 기반 QA 어시스턴트입니다.
-아래 '컨텍스트'에 있는 내용만 근거로 답변하세요.
-정답은 한 문장(또는 한 줄)로만 짧게 답하라.
-컨텍스트에 없는 내용은 추측하지 말고 '문서에 근거가 부족합니다'라고 말하세요.
-가능하면 핵심 근거 문장을 짧게 인용하고, 출처 조각 번호([1],[2]...)를 함께 표시하세요.
-
-질문: {question}
-
-컨텍스트:
-{context_blocks}
-
-답변:"""
-
-
-# -----------------------------
-# Metrics: BLEU, Semantic Similarity
-# -----------------------------
-def compute_bleu(reference: str, hypothesis: str, max_ngram: int = 4) -> float:
-    ref_tokens = tokenize_ko_en(reference)
-    hyp_tokens = tokenize_ko_en(hypothesis)
-    if len(hyp_tokens) == 0 or len(ref_tokens) == 0:
+def compute_bleu(ref: str, hyp: str, max_ngram: int = 4) -> float:
+    """BLEU-4 (통합 전 evaluate.py와 동일한 설정)"""
+    ref_tokens = eng.tokenize_ko_en(ref)
+    hyp_tokens = eng.tokenize_ko_en(hyp)
+    if not ref_tokens or not hyp_tokens:
         return 0.0
     weights = tuple([1.0 / max_ngram] * max_ngram)
-    smoothie = SmoothingFunction().method4
-    # BLEU is in [0, 1]
-    return float(sentence_bleu([ref_tokens], hyp_tokens, weights=weights, smoothing_function=smoothie))
+    smooth = SmoothingFunction().method4
+    return float(sentence_bleu([ref_tokens], hyp_tokens, weights=weights, smoothing_function=smooth))
 
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     a = a.astype(np.float32)
     b = b.astype(np.float32)
-    na = np.linalg.norm(a) + 1e-9
-    nb = np.linalg.norm(b) + 1e-9
-    return float(np.dot(a, b) / (na * nb))
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom < 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / denom)
 
 
-def semantic_similarity(embed_model: SentenceTransformer, a: str, b: str, map_to_01: bool = True) -> float:
-    va = embed_model.encode([a], convert_to_numpy=True, normalize_embeddings=True)[0].astype(np.float32)
-    vb = embed_model.encode([b], convert_to_numpy=True, normalize_embeddings=True)[0].astype(np.float32)
-    cos = cosine_sim(va, vb)  # [-1, 1]
+def semantic_similarity(embed_model: SentenceTransformer, ref: str, hyp: str, map_to_01: bool = True) -> float:
+    v = embed_model.encode([ref, hyp], normalize_embeddings=True)
+    cos = cosine_sim(np.asarray(v[0]), np.asarray(v[1]))  # -1..1 (대부분 0..1 근처)
     if map_to_01:
-        score = (cos + 1.0) / 2.0
-        return float(max(0.0, min(1.0, score)))
+        return float(max(0.0, min(1.0, (cos + 1.0) / 2.0)))
     return float(cos)
 
 
 # -----------------------------
-# LLM Judging -> always score 0..1
+# Robust CSV loading
 # -----------------------------
-def judge_json(judge_llm: LlamaCpp, prompt: str) -> Dict[str, Any]:
-    try:
-        raw = llama_judge(judge_llm, prompt)
-    except Exception as e:
-        # invoke 자체가 실패한 경우에도 점수는 0으로 반환
-        return {"ok": False, "score": 0.0, "error": str(e)}
-
-    # 디버그 출력은 raw가 생긴 뒤에만
-    
-    # JSON만 추출
-    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if not m:
-        return {"ok": False, "score": 0.0, "raw": raw[:2000]}
-
-    try:
-        obj = json.loads(m.group(0))
-        if "score" not in obj:
-            obj["score"] = 0.0
-        obj["ok"] = True
-        # clamp
-        obj["score"] = float(max(0.0, min(1.0, float(obj.get("score", 0.0)))))
-        return obj
-    except Exception as e:
-        return {"ok": False, "score": 0.0, "raw": raw[:2000], "error": str(e)}
+def read_csv_robust(path: str) -> pd.DataFrame:
+    for enc in ("utf-8", "utf-8-sig", "cp949", "latin1"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    # last resort
+    return pd.read_csv(path, encoding="utf-8", errors="replace")
 
 
-
-def faithfulness_prompt(question: str, answer: str, context_blocks: str) -> str:
-    return f"""역할: 당신은 RAG 평가자입니다.
-목표: '답변'이 '컨텍스트'에 의해 충분히 뒷받침되는지(환각 여부) 평가합니다.
-
-규칙:
-- 컨텍스트에 명시/강하게 함의된 내용만 'supported'로 봅니다.
-- 컨텍스트에 없는 새로운 사실/수치/고유명사/규정 조항을 단정하면 'unsupported'입니다.
-- 출력은 반드시 JSON 하나만.
-
-입력:
-[질문]
-{question}
-
-[답변]
-{answer}
-
-[컨텍스트]
-{context_blocks}
-
-JSON 출력 스키마:
-{{
-  "supported": true/false,
-  "score": 0~1,
-  "unsupported_claims": ["...","..."],
-  "notes": "짧은 근거"
-}}
-"""
+def normalize_filename(s: str) -> str:
+    s = os.path.basename(str(s))
+    return s.strip()
 
 
-def truthfulness_prompt(question: str, answer: str, ground_truth: str) -> str:
-    return f"""역할: 당신은 QA 평가자입니다.
-목표: '답변'이 '정답(GT)'의 핵심 사실관계를 정확히 포함하는지 평가합니다.
-
-규칙:
-- 정답의 핵심 사실(주체/행위/조건/수치/기준)이 누락되거나 틀리면 감점.
-- 표현/문장 형태가 달라도 의미가 같으면 OK.
-- 출력은 반드시 JSON 하나만.
-
-입력:
-[질문]
-{question}
-
-[정답(GT)]
-{ground_truth}
-
-[답변]
-{answer}
-
-JSON 출력 스키마:
-{{
-  "correct": true/false,
-  "score": 0~1,
-  "missing_facts": ["..."],
-  "wrong_facts": ["..."],
-  "notes": "짧은 근거"
-}}
-"""
+def get_relevant_sources_from_row(row: pd.Series) -> Set[str]:
+    sources: Set[str] = set()
+    # common columns
+    for col in row.index:
+        if str(col).lower().startswith("relevant_sources"):
+            val = row.get(col, "")
+            if pd.isna(val) or val == "":
+                continue
+            # allow list-like strings
+            parts = re.split(r"[|;,]\s*|\s*\n\s*", str(val))
+            for p in parts:
+                p = p.strip()
+                if p:
+                    sources.add(normalize_filename(p))
+    # fallback
+    if "source_file" in row.index and not pd.isna(row.get("source_file")):
+        sources.add(normalize_filename(row.get("source_file")))
+    if "relevant_docs" in row.index and not pd.isna(row.get("relevant_docs")):
+        sources.add(normalize_filename(row.get("relevant_docs")))
+    return {s for s in sources if s}
 
 
-def context_recall_prompt(question: str, ground_truth: str, context_blocks: str) -> str:
-    return f"""역할: 당신은 RAG 평가자입니다.
-목표: 제공된 '컨텍스트'만으로 '정답(GT)'에 도달 가능했는지(답변 가능성) 평가합니다.
-
-규칙:
-- 컨텍스트에 정답을 직접 말하지 않아도, 합리적으로 유추 가능한 근거가 있으면 true.
-- 컨텍스트가 부족하면 false.
-- 출력은 반드시 JSON 하나만.
-
-입력:
-[질문]
-{question}
-
-[정답(GT)]
-{ground_truth}
-
-[컨텍스트]
-{context_blocks}
-
-JSON 출력 스키마:
-{{
-  "answerable": true/false,
-  "score": 0~1,
-  "evidence": ["컨텍스트 근거 요약..."],
-  "notes": "짧은 근거"
-}}
-"""
-
-
-# -----------------------------
-# Retrieval Metrics -> always numeric score
-# - CSV: source_file + page or relevant_docs + page
-# - doc.metadata["source"] may be path; compare by basename
-# -----------------------------
-def normalize_filename(x: str) -> str:
-    return os.path.basename(str(x)).strip()
-
-
-def get_relevant_sources_from_row(row: pd.Series) -> Set[Tuple[str, int]]:
-    # Try common columns:
-    # 1) relevant_sources like "file.pdf:12;file2.pdf:3"
-    # Prefer 0-index labels if present
-    for col in ["relevant_sources_0idx", "relevant_sources", "relevant_sources_1idx"]:
-        if col in row.index and pd.notna(row[col]) and str(row[col]).strip():
-            s = str(row[col]).strip()
-            out = set()
-            for part in re.split(r"[;,	]+", s):
-                part = part.strip()
-                if not part:
-                    continue
-                m = re.match(r"(.+):(\d+)$", part)
-                if m:
-                    out.add((normalize_filename(m.group(1)), int(m.group(2))))
-            if out:
-                return out
-
-    # 2) source_file + page
-    src_col = None
-    for c in ["source_file", "relevant_docs", "relevant_doc", "doc", "source"]:
-        if c in row.index and pd.notna(row[c]) and str(row[c]).strip():
-            src_col = c
-            break
-
-    page = None
-    for pc in ["page", "pages", "page_no"]:
-        if pc in row.index and pd.notna(row[pc]):
-            try:
-                # CSV page is typically 1-index; convert to 0-index for docs.pkl
-                page = int(row[pc]) - 1
-                break
-            except Exception:
-                pass
-
-    if src_col is not None and page is not None:
-        return {(normalize_filename(row[src_col]), int(page))}
-    return set()
-
-
-def get_relevant_chunk_ids_from_row(row: pd.Series) -> Set[int]:
-    # optional: relevant_chunk_ids like "12;98"
-    if "relevant_chunk_ids" not in row.index or pd.isna(row["relevant_chunk_ids"]):
-        return set()
-    s = str(row["relevant_chunk_ids"]).strip()
+def _parse_int_set(val: Any) -> Set[int]:
+    out: Set[int] = set()
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return out
+    s = str(val).strip()
     if not s:
-        return set()
-    parts = re.split(r"[;, \t]+", s)
-    out = set()
-    for p in parts:
-        if p.strip().isdigit():
-            out.add(int(p.strip()))
+        return out
+    # try list-like
+    s = s.strip("[](){}")
+    for tok in re.split(r"[|,;\s]+", s):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.isdigit():
+            out.add(int(tok))
     return out
 
 
-def derive_relevant_chunk_ids_from_excerpt(
-    row: pd.Series,
-    docs: List[Document],
-    page_to_chunkids: Dict[Tuple[str, int], List[int]],
+def get_relevant_chunk_ids_from_row(row: pd.Series) -> Set[int]:
+    ids: Set[int] = set()
+    for col in row.index:
+        if str(col).lower().startswith("relevant_chunk"):
+            ids |= _parse_int_set(row.get(col))
+    # also accept these legacy columns
+    for col in ("relevant_doc_chunk_ids", "chunk_id", "chunk_ids"):
+        if col in row.index:
+            ids |= _parse_int_set(row.get(col))
+    return ids
+
+
+def derive_relevant_chunk_ids_from_source_page(
+    docs: Sequence[Any],
+    sources: Set[str],
+    page_1based: Optional[int],
 ) -> Set[int]:
-    """Derive ground-truth chunk_ids from (source_file, page, evidence_excerpt).
-    This makes Recall@k/MRR harder and more meaningful than page-level labels.
-    """
-    needed = ["source_file", "page", "evidence_excerpt"]
-    for c in needed:
-        if c not in row.index or pd.isna(row[c]) or not str(row[c]).strip():
-            return set()
-
-    src = os.path.basename(str(row["source_file"]).strip())
-    try:
-        # CSV page is 1-index; docs are 0-index
-        page0 = int(row["page"]) - 1
-    except Exception:
+    """If CSV provides (source_file + page), map to chunk_ids by matching docs metadata."""
+    if not sources or not page_1based:
         return set()
-
-    excerpt = str(row["evidence_excerpt"]).strip()
-    if not excerpt:
-        return set()
-
-    cids = page_to_chunkids.get((src, page0), [])
-    if not cids:
-        return set()
-
-    def norm(s: str) -> str:
-        return re.sub(r"\s+", " ", str(s)).strip()
-
-    ex_n = norm(excerpt)
-    # Use prefix for robust matching (OCR/spacing differences)
-    ex_prefix = ex_n[:120]
-
-    hit: Set[int] = set()
-    cid_set = set(cids)
+    page0 = int(page_1based) - 1
+    out: Set[int] = set()
     for d in docs:
-        cid = d.metadata.get("chunk_id", None)
-        if cid is None or int(cid) not in cid_set:
-            continue
-        if ex_prefix and ex_prefix in norm(d.page_content):
-            hit.add(int(cid))
-
-    # Fallback: if no match, pick the first chunk on that page
-    if not hit and cids:
-        hit.add(int(cids[0]))
-
-    return hit
+        meta = getattr(d, "metadata", {}) or {}
+        src = normalize_filename(meta.get("source") or meta.get("source_basename") or "")
+        if src in sources and int(meta.get("page", -999)) == page0:
+            cid = meta.get("chunk_id")
+            if cid is not None:
+                out.add(int(cid))
+    return out
 
 
-def recall_at_k(relevant_chunk_ids: Set[int], relevant_sources: Set[Tuple[str, int]], retrieved_docs: List[Document]) -> float:
-    # If no labels, score is 0.0 (always numeric per requirement)
-    if not relevant_chunk_ids and not relevant_sources:
+def recall_at_k(relevant: Set[int], retrieved_ids: List[int], k: int) -> float:
+    if not relevant:
         return 0.0
-
-    hit = 0
-    total = 0
-
-    if relevant_chunk_ids:
-        total += len(relevant_chunk_ids)
-        got = {d.metadata.get("chunk_id") for d in retrieved_docs}
-        hit += len(relevant_chunk_ids.intersection({x for x in got if x is not None}))
-
-    if relevant_sources:
-        total += len(relevant_sources)
-        got2 = {(normalize_filename(d.metadata.get("source", "")), int(d.metadata.get("page")))
-                for d in retrieved_docs
-                if d.metadata.get("source") is not None and d.metadata.get("page") is not None}
-        hit += len(relevant_sources.intersection(got2))
-
-    return float(hit / total) if total > 0 else 0.0
+    top = set(retrieved_ids[:k])
+    hit = len(relevant & top)
+    return float(hit) / float(len(relevant))
 
 
-def mrr(relevant_chunk_ids: Set[int], relevant_sources: Set[Tuple[str, int]], retrieved_docs: List[Document]) -> float:
-    # If no labels, score is 0.0 (always numeric per requirement)
-    if not relevant_chunk_ids and not relevant_sources:
+def mrr(relevant: Set[int], retrieved_ids: List[int]) -> float:
+    if not relevant:
         return 0.0
-
-    for rank_i, d in enumerate(retrieved_docs, start=1):
-        cid = d.metadata.get("chunk_id")
-        src = d.metadata.get("source")
-        page = d.metadata.get("page")
-        if (cid is not None and cid in relevant_chunk_ids) or (
-            src is not None and page is not None and (normalize_filename(src), int(page)) in relevant_sources
-        ):
-            return float(1.0 / rank_i)
+    for i, cid in enumerate(retrieved_ids, start=1):
+        if cid in relevant:
+            return 1.0 / float(i)
     return 0.0
 
 
 # -----------------------------
-# Eval data loader
+# Judge prompts (JSON only)
 # -----------------------------
-def find_single_csv(eval_dir_or_file: str) -> str:
-    # 1) 파일 경로가 직접 들어온 경우
-    if os.path.isfile(eval_dir_or_file):
-        if not eval_dir_or_file.lower().endswith(".csv"):
-            raise ValueError("평가 파일은 .csv 여야 합니다.")
-        return eval_dir_or_file
-
-    # 2) 폴더 경로인 경우
-    if not os.path.isdir(eval_dir_or_file):
-        raise FileNotFoundError(f"eval_data 경로가 없습니다: {eval_dir_or_file}")
-
-    csvs = glob.glob(os.path.join(eval_dir_or_file, "*.csv"))
-    if len(csvs) != 1:
-        raise FileNotFoundError(
-            f"{eval_dir_or_file} 안에 CSV가 정확히 1개 있어야 합니다. 현재: {len(csvs)}개"
-        )
-    return csvs[0]
+def _json_only_rule() -> str:
+    return "반드시 JSON만 출력하세요. 설명 텍스트/마크다운/코드펜스는 금지합니다."
 
 
+def faithfulness_prompt(question: str, answer: str, context: str) -> str:
+    return f"""{_json_only_rule()}
+다음은 문서 기반 QA의 '근거 충실성(Faithfulness)' 평가입니다.
+- 기준: 답변의 모든 핵심 주장(법령/수치/요구사항/권고)이 컨텍스트에 의해 직접 뒷받침되면 score=1.0
+- 컨텍스트에 없는 내용을 지어냈거나 과장/추가하면 score를 낮추세요.
+0.0~1.0 사이 score를 반환하세요.
 
-def detect_columns(df: pd.DataFrame) -> Tuple[str, str]:
-    # question column
-    q_candidates = ["question", "query", "q"]
-    gt_candidates = ["answer", "ground_truth", "gt", "gold"]
-    q_col = next((c for c in q_candidates if c in df.columns), None)
-    gt_col = next((c for c in gt_candidates if c in df.columns), None)
-    if q_col is None or gt_col is None:
-        raise ValueError(
-            f"CSV에는 질문/정답 컬럼이 필요합니다. "
-            f"질문 후보={q_candidates}, 정답 후보={gt_candidates}. 현재 컬럼={list(df.columns)}"
-        )
-    return q_col, gt_col
+JSON 스키마:
+{{"score": <0.0~1.0>, "notes": "<짧은 이유>", "hallucinated_claims": ["..."], "supported_claims": ["..."]}}
+
+[질문]
+{question}
+
+[답변]
+{answer}
+
+[컨텍스트]
+{context}
+"""
 
 
+def truthfulness_prompt(question: str, answer: str, ground_truth: str) -> str:
+    return f"""{_json_only_rule()}
+다음은 '정답성(Truthfulness)' 평가입니다.
+- 기준: 답변이 ground_truth의 핵심 사실관계를 얼마나 정확히 포함하는지(의미 기반) score로 평가
+- 과도한 누락/오답/왜곡이 있으면 score를 낮추세요.
+0.0~1.0 사이 score를 반환하세요.
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate Hybrid RAG (BM25+FAISS) with retrieval/debug options.")
-    p.add_argument("--eval_path", type=str, default=None,
-                   help="평가 CSV 파일 경로 또는 평가 CSV가 1개 들어있는 폴더 경로. (기본: cfg.eval_data_dir)")
-    p.add_argument("--debug_n", type=int, default=0,
-                   help="처음 N개 샘플에 대해 retrieval 디버그(Top-k, GT 매칭, 텍스트 일부) 출력 및 JSONL 저장")
-    p.add_argument("--retrieval_only", action="store_true",
-                   help="Retrieval 지표(Recall@k, MRR)만 계산. LLM 생성/판정 및 BLEU/SemSim 스킵")
-    p.add_argument("--save_jsonl", type=str, default=None,
-                   help="디버그/분석용 JSONL 저장 경로. (기본: eval_data/retrieval_debug.jsonl)")
-    p.add_argument("--max_rows", type=int, default=None,
-                   help="평가를 앞에서 N개만 수행(디버그/빠른 점검용)")
-    # Optional overrides
+JSON 스키마:
+{{"score": <0.0~1.0>, "notes": "<짧은 이유>", "missing_facts": ["..."], "wrong_facts": ["..."]}}
 
-    help="디버그/분석용 JSONL 저장 경로. (기본: eval_data/retrieval_debug.jsonl)"
-    # Optional overrides
-    p.add_argument("--alpha", type=float, default=None, help="Hybrid alpha override")
-    p.add_argument("--top_k", type=int, default=None, help="Top-k override")
-    p.add_argument("--fetch_k", type=int, default=None, help="Fetch-k override")
-    return p.parse_args()
+[질문]
+{question}
+
+[답변]
+{answer}
+
+[ground_truth]
+{ground_truth}
+"""
+
+
+def context_recall_prompt(question: str, ground_truth: str, context: str) -> str:
+    return f"""{_json_only_rule()}
+다음은 'Context Recall(답변 가능성)' 평가입니다.
+- 기준: 컨텍스트 안에 ground_truth를 유추할 핵심 정보가 하나라도 있으면 score=1에 가깝게
+- 없으면 score=0에 가깝게
+0.0~1.0 사이 score를 반환하세요.
+
+JSON 스키마:
+{{"score": <0.0~1.0>, "notes": "<짧은 이유>", "evidence": ["<컨텍스트 근거 일부>"]}}
+
+[질문]
+{question}
+
+[ground_truth]
+{ground_truth}
+
+[컨텍스트]
+{context}
+"""
+
+
+def judge_json(llm, prompt: str, max_tokens: int, temperature: float) -> Tuple[float, str]:
+    raw = ""
+    try:
+        raw = llm(prompt, max_tokens=max_tokens, temperature=temperature)
+        # extract first JSON object
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        if not m:
+            return 0.0, raw
+        obj = json.loads(m.group(0))
+        score = float(obj.get("score", 0.0))
+        if score < 0.0: score = 0.0
+        if score > 1.0: score = 1.0
+        return score, raw
+    except Exception:
+        return 0.0, raw
+
 
 # -----------------------------
 # Main
 # -----------------------------
-def main(args: argparse.Namespace | None = None):
+def parse_args():
+    p = argparse.ArgumentParser(description="Evaluate Hybrid RAG (BM25+FAISS) using rag_engine shared core.")
+    p.add_argument("--eval_csv", type=str, default=None, help="평가 CSV 경로")
+    p.add_argument("--report_path", type=str, default=None)
+    p.add_argument("--save_jsonl", type=str, default=None)
+    p.add_argument("--max_rows", type=int, default=None)
+    p.add_argument("--debug_n", type=int, default=None)
+    p.add_argument("--retrieval_only", action="store_true")
+    p.add_argument("--disable_judge", action="store_true")
+    p.add_argument("--gguf_path", type=str, default=None, help="GGUF 경로 override")
+    p.add_argument("--alpha", type=float, default=None)
+    p.add_argument("--top_k", type=int, default=None)
+    p.add_argument("--fetch_k", type=int, default=None)
+
+    p.add_argument("--show", action="store_true", help="터미널에 Q/컨텍스트/프롬프트/답변 출력")
+    p.add_argument("--show_every", type=int, default=1, help="N개마다 출력(기본: 매 샘플)")
+    p.add_argument("--show_topk", type=int, default=3, help="출력할 컨텍스트 Top-k 개수")
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
     cfg = EvalConfig()
 
-    if args is None:
-        args = parse_args()
+    # 통합 전 evaluate.py와 동일한 생성 프롬프트 스타일 사용
+    cfg.rag.prompt_mode = 'eval'
 
+    if args.eval_csv: cfg.eval_csv = args.eval_csv
+    if args.report_path: cfg.report_path = args.report_path
+    if args.save_jsonl: cfg.save_jsonl = args.save_jsonl
+    if args.max_rows is not None: cfg.max_rows = int(args.max_rows)
+    if args.debug_n is not None: cfg.debug_n = int(args.debug_n)
+    if args.retrieval_only: cfg.retrieval_only = True
+    if args.disable_judge: cfg.enable_judge = False
 
-    
-    # CLI overrides
-    if args.alpha is not None:
-        cfg.alpha = float(args.alpha)
-    if args.top_k is not None:
-        cfg.top_k = int(args.top_k)
-    if args.fetch_k is not None:
-        cfg.fetch_k = int(args.fetch_k)
+    # RAGConfig overrides
+    if args.gguf_path: cfg.rag.gguf_path = args.gguf_path
+    if args.alpha is not None: cfg.rag.alpha = float(args.alpha)
+    if args.top_k is not None: cfg.rag.top_k = int(args.top_k)
+    if args.fetch_k is not None: cfg.rag.fetch_k = int(args.fetch_k)
 
-    # NLTK 준비(이미 설치되어 있으면 스킵됨)
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt", quiet=True)
+    os.makedirs(os.path.dirname(cfg.report_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.save_jsonl) or ".", exist_ok=True)
 
-    # Load VectorDB
-    index, docs, bm25 = load_vectordb(cfg.vectordb_dir)
+    df = read_csv_robust(cfg.eval_csv)
+    if cfg.max_rows and cfg.max_rows > 0:
+        df = df.head(cfg.max_rows)
 
-    # Models
-    embed_model = SentenceTransformer(cfg.embedding_model)
-    llm = None
-    judge = None
-    if not args.retrieval_only:
-        llm = build_llama(cfg)
-        judge = build_llama(cfg)  # reuse same llama instance for judging
+    # Load shared resources once
+    resources = eng.load_resources(cfg.rag)
 
-    retriever = HybridRetriever(docs, bm25, index, embed_model)
+    # embedding model for SemSim (reuse same embedding model as retrieval)
+    sem_model = SentenceTransformer(cfg.rag.embedding_model)
 
-    # Build (source_basename, page) -> [chunk_id,...] map for chunk-level GT derivation
-    page_to_chunkids: Dict[Tuple[str, int], List[int]] = {}
-    for d in docs:
-        src = os.path.basename(str(d.metadata.get("source", "")))
-        page = d.metadata.get("page", None)
-        cid = d.metadata.get("chunk_id", None)
-        if src and page is not None and cid is not None:
-            page_to_chunkids.setdefault((src, int(page)), []).append(int(cid))
-
-    # Load eval CSV
-    csv_path = find_single_csv(args.eval_path or cfg.eval_data_dir)
-    try:
-        df = pd.read_csv(csv_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        try:
-            df = pd.read_csv(csv_path, encoding="cp949")
-        except UnicodeDecodeError:
-            df = pd.read_csv(csv_path, encoding="latin1")
-
-    if args.save_jsonl:
-        save_jsonl = args.save_jsonl
-    else:
-        base_dir = (cfg.eval_data_dir if os.path.isdir(cfg.eval_data_dir) else os.path.dirname(cfg.eval_data_dir))
-        if args.eval_path:
-            base_dir = (args.eval_path if os.path.isdir(args.eval_path) else os.path.dirname(args.eval_path))
-        save_jsonl = os.path.join(base_dir or ".", "retrieval_debug.jsonl")
-
-    q_col, gt_col = detect_columns(df)
-
-    # Accumulators (all numeric)
-    bleu_list: List[float] = []
-    semsim_list: List[float] = []
-    faithful_scores: List[float] = []
-    truthful_scores: List[float] = []
-    ctxrecall_scores: List[float] = []
-    recallk_list: List[float] = []
-    mrr_list: List[float] = []
-
-    per_item: List[Dict[str, Any]] = []
-
-    for i, row in df.iterrows():
-        if args.max_rows is not None and i >= args.max_rows:
-            break
-
-        # Defaults to keep result serialization safe
-        faithful = {"score": 0.0}
-        truthful = {"score": 0.0}
-        ctxrec = {"score": 0.0}
-
-        q = str(row[q_col])
-        gt = str(row[gt_col])
-
-        rel_sources = get_relevant_sources_from_row(row)
-
-        # Derive chunk-level GT from evidence_excerpt when possible (more meaningful than page-level)
-        derived_chunk_ids = derive_relevant_chunk_ids_from_excerpt(row, docs, page_to_chunkids)
-        rel_chunk_ids = get_relevant_chunk_ids_from_row(row) | derived_chunk_ids
-
-        # If we have chunk-level labels, focus retrieval metrics on chunk_ids (avoid overly-easy page hits)
-        if derived_chunk_ids:
-            rel_sources = set()
-
-        # Retrieve
-        retrieved = retriever.retrieve(q, cfg.alpha, cfg.top_k, cfg.fetch_k)
-        retrieved_docs = [d for (d, _, _) in retrieved]
-        context_blocks = make_context_blocks(retrieved)
-
-        # Retrieval debug/logging (LLM output 없이도 검증 가능)
-        def _hit_rank(rel_sources, rel_chunk_ids, retrieved_docs):
-            for rnk, dd in enumerate(retrieved_docs, start=1):
-                src = os.path.basename(str(dd.metadata.get("source", "")))
-                page = dd.metadata.get("page", None)
-                cid = dd.metadata.get("chunk_id", None)
-                if cid is not None and int(cid) in rel_chunk_ids:
-                    return rnk, "chunk"
-                if src and page is not None and (src, int(page)) in rel_sources:
-                    return rnk, "page"
-            return None, None
-
-        if args.debug_n and i < args.debug_n:
-            print("\n" + "=" * 100)
-            print(f"[DEBUG row {i}]")
-            print("QUERY(first 250):", q[:250].replace("\n", " "))
-            print("GT sources:", sorted(list(rel_sources))[:5])
-            print("GT chunk_ids:", sorted(list(rel_chunk_ids))[:10])
-
-            print("\n[TOP-K Retrieved]")
-            for (dd, _sc, dbg) in retrieved:
-                print(f" rank={dbg['rank']} src={dbg['source_basename']} page={dbg['page']} chunk={dbg['chunk_id']} hybrid={dbg['hybrid']:.3f} bm25={dbg['bm25']:.2f} vec={dbg['vec']:.3f}")
-                print("  text[0:200]:", dd.page_content[:200].replace("\n", " "))
-
-            rnk, kind = _hit_rank(rel_sources, rel_chunk_ids, retrieved_docs)
-            print("\n[HIT CHECK] hit_rank:", rnk, "kind:", kind)
-
-            # JSONL 저장
-            os.makedirs(os.path.dirname(save_jsonl) or ".", exist_ok=True)
-            with open(save_jsonl, "a", encoding="utf-8") as jf:
-                jf.write(json.dumps({
-                    "row": int(i),
-                    "query": q,
-                    "ground_truth": gt,
-                    "labels": {
-                        "relevant_sources": sorted(list(rel_sources)),
-                        "relevant_chunk_ids": sorted(list(rel_chunk_ids)),
-                    },
-                    "retrieval_topk": [
-                        {
-                            "rank": dbg["rank"],
-                            "source": dbg["source_basename"],
-                            "page": dbg["page"],
-                            "chunk_id": dbg["chunk_id"],
-                            "hybrid": dbg["hybrid"],
-                            "bm25": dbg["bm25"],
-                            "vec": dbg["vec"],
-                            "text_preview": dd.page_content[:300],
-                        }
-                        for (dd, _s, dbg) in retrieved
-                    ],
-                }, ensure_ascii=False) + "\n")
-
-        # Generate (optional)
-        pred = ""
-        bleu = 0.0
-        semsim = 0.0
-        faithful_score = 0.0
-        truthful_score = 0.0
-        ctxrec_score = 0.0
-
-        if not args.retrieval_only:
-            prompt = gen_prompt(q, context_blocks)
-            if args.debug_n and i < args.debug_n:
-                print("\n[PROMPT preview]")
-                print("SYSTEM:\n"+SYSTEM_PROMPT[:400])
-                print("\nUSER:\n"+build_user_input(q, context_blocks)[:800])
-            pred = llama_chat(llm, SYSTEM_PROMPT, build_user_input(q, context_blocks), max_tokens=cfg.max_tokens, temperature=cfg.temperature)
-            if args.debug_n and i < args.debug_n:
-                print("\n[GENERATION OUTPUT preview]")
-                print(str(pred)[:1200])
-
-            # Generation metrics
-            bleu = compute_bleu(gt, pred, max_ngram=cfg.bleu_max_ngram)  # 0..1
-            semsim = semantic_similarity(embed_model, gt, pred, map_to_01=cfg.semantic_map_to_01)  # 0..1
-
-            # LLM judge (0..1) - best effort
-            faithful = judge_json(judge, faithfulness_prompt(q, pred, context_blocks))
-            truthful = judge_json(judge, truthfulness_prompt(q, pred, gt))
-            ctxrec = judge_json(judge, context_recall_prompt(q, gt, context_blocks))
-
-            faithful_score = float(faithful.get("score", 0.0))
-            truthful_score = float(truthful.get("score", 0.0))
-            ctxrec_score = float(ctxrec.get("score", 0.0))
-        # Retrieval metrics (0..1)
-        r_at_k = recall_at_k(rel_chunk_ids, rel_sources, retrieved_docs)
-        mrr_v = mrr(rel_chunk_ids, rel_sources, retrieved_docs)
-
-        # Save accumulators
-        bleu_list.append(bleu)
-        semsim_list.append(semsim)
-        faithful_scores.append(faithful_score)
-        truthful_scores.append(truthful_score)
-        ctxrecall_scores.append(ctxrec_score)
-        recallk_list.append(r_at_k)
-        mrr_list.append(mrr_v)
-
-        per_item.append({
-            "row": int(i),
-            "question": q,
-            "ground_truth": gt,
-            "prediction": pred,
-
-            "scores": {
-                # Generation quality
-                "bleu": bleu,
-                "semantic_similarity": semsim,
-                "faithfulness": faithful_score,
-                "truthfulness": truthful_score,
-                # Retrieval quality
-                "context_recall": ctxrec_score,
-                "recall@k": r_at_k,
-                "mrr": mrr_v,
-            },
-
-            # Optional detailed judge outputs for debugging
-            "judge_details": {
-                "faithfulness": faithful,
-                "truthfulness": truthful,
-                "context_recall": ctxrec,
-            },
-
-            "retrieval_topk": [
-                {
-                    "rank": dbg["rank"],
-                    "chunk_id": dbg["chunk_id"],
-                    "source": dbg["source_basename"],
-                    "page": dbg["page"],
-                    "hybrid": dbg["hybrid"],
-                    "bm25": dbg["bm25"],
-                    "vec": dbg["vec"],
-                }
-                for (_, _, dbg) in retrieved
-            ],
-
-            "relevance_labels": {
-                "relevant_chunk_ids": sorted(list(rel_chunk_ids)),
-                "relevant_sources": sorted(list(rel_sources)),
-            }
-        })
-
-        print(
-            f"[{i+1}/{len(df)}] "
-            f"BLEU={bleu:.3f} SemSim={semsim:.3f} "
-            f"Faith={faithful_score:.3f} Truth={truthful_score:.3f} "
-            f"CtxRecall={ctxrec_score:.3f} Recall@k={r_at_k:.3f} MRR={mrr_v:.3f}"
+    # judge uses same llama (stable direct call) by default
+    def judge_call(prompt: str, max_tokens: int, temperature: float) -> str:
+        return eng.llama_chat(
+            resources.llm,
+            "당신은 엄격한 평가자입니다. " + "JSON만 출력하세요.",
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=1.0,
         )
 
+    # Metrics accum
+    rows_out: List[Dict[str, Any]] = []
+    debug_written = 0
+    with open(cfg.save_jsonl, "w", encoding="utf-8") as jf:
+        for idx, row in df.iterrows():
+            q = str(row.get("question", row.get("query", ""))).strip()
+            gt = str(row.get("ground_truth", "")).strip()
+
+            retrieved = eng.retrieve(resources, q)
+            retrieved_ids = [int(dbg.get("chunk_id")) for (_d, _s, dbg) in retrieved if dbg.get("chunk_id") is not None]
+
+            # ground truth ids (robust)
+            rel_sources = get_relevant_sources_from_row(row)
+            rel_ids = get_relevant_chunk_ids_from_row(row)
+            # 추가: relevant_sources_1idx/0idx 를 chunk_id로도 해석 (CSV 호환)
+            if not rel_ids:
+                for col in ("relevant_sources_1idx", "relevant_sources_0idx"):
+                    if col in row.index:
+                        rel_ids |= _parse_int_set(row.get(col))
+
+            # fallback mapping by (source + page)
+            page = None
+            if "page" in row.index and not pd.isna(row.get("page")):
+                try:
+                    page = int(row.get("page"))
+                except Exception:
+                    page = None
+            if not rel_ids:
+                rel_ids = derive_relevant_chunk_ids_from_source_page(resources.docs, rel_sources, page)
+
+            rec_k = recall_at_k(rel_ids, retrieved_ids, cfg.rag.top_k)
+            mrr_v = mrr(rel_ids, retrieved_ids)
+
+            # generation
+            if cfg.retrieval_only:
+                pred = ""
+                bleu = 0.0
+                semsim = 0.0
+                faith = 0.0
+                truth = 0.0
+                ctxrec = 0.0
+                ctx_blocks = eng.make_context_blocks(retrieved)
+                user_prompt = ""
+            else:
+                pred, ctx_blocks, user_prompt = eng.generate(resources, q, retrieved)
+                print("\n" + "="*120)
+                print("[Q]", q)
+                print("[A]", pred)
+                print("="*120 + "\n")
+                
+                bleu = compute_bleu(gt, pred, max_ngram=cfg.bleu_max_ngram)
+                semsim = semantic_similarity(sem_model, gt, pred, map_to_01=cfg.semantic_map_to_01)
+
+                faith = truth = ctxrec = 0.0
+                if cfg.enable_judge:
+                    faith, _rawf = judge_json(
+                        lambda p, max_tokens, temperature: judge_call(p, max_tokens, temperature),
+                        faithfulness_prompt(q, pred, ctx_blocks),
+                        max_tokens=cfg.judge_max_tokens,
+                        temperature=cfg.judge_temperature,
+                    )
+                    truth, _rawt = judge_json(
+                        lambda p, max_tokens, temperature: judge_call(p, max_tokens, temperature),
+                        truthfulness_prompt(q, pred, gt),
+                        max_tokens=cfg.judge_max_tokens,
+                        temperature=cfg.judge_temperature,
+                    )
+                    ctxrec, _rawc = judge_json(
+                        lambda p, max_tokens, temperature: judge_call(p, max_tokens, temperature),
+                        context_recall_prompt(q, gt, ctx_blocks),
+                        max_tokens=cfg.judge_max_tokens,
+                        temperature=cfg.judge_temperature,
+                    )
+
+            out = {
+                "row": int(idx),
+                "bleu": float(bleu),
+                "semantic_similarity": float(semsim),
+                "faithfulness": float(faith),
+                "truthfulness": float(truth),
+                "context_recall": float(ctxrec),
+                "recall_at_k": float(rec_k),
+                "mrr": float(mrr_v),
+            }
+            rows_out.append(out)
+
+            # debug print + jsonl
+            if cfg.debug_n and debug_written < cfg.debug_n:
+                debug_written += 1
+                print("\n" + "=" * 100)
+                print(f"[DEBUG row {idx}]")
+                print("QUERY(first 250):", q[:250].replace("\n", " "))
+                print("GT sources:", sorted(list(rel_sources))[:5])
+                print("GT chunk_ids:", sorted(list(rel_ids))[:10])
+                print("\n[TOP-K Retrieved]")
+                for (_d, _s, dbg) in retrieved:
+                    print(
+                        f" rank={dbg['rank']} src={dbg['source_basename']} page={dbg['page']} "
+                        f"chunk={dbg['chunk_id']} hybrid={dbg['hybrid']:.3f} bm25={dbg['bm25']:.2f} vec={dbg['vec']:.3f}"
+                    )
+                if not cfg.retrieval_only:
+                    print("\n[PROMPT preview]\n", user_prompt[:1200])
+                    print("\n[GENERATION OUTPUT preview]\n", pred[:800])
+
+                jf.write(json.dumps({
+                    "row": int(idx),
+                    "query": q,
+                    "gt_sources": sorted(list(rel_sources)),
+                    "gt_chunk_ids": sorted(list(rel_ids)),
+                    "retrieved": [dbg for (_d, _s, dbg) in retrieved],
+                    "prompt": user_prompt if not cfg.retrieval_only else "",
+                    "pred": pred if not cfg.retrieval_only else "",
+                }, ensure_ascii=False) + "\n")
+
+            print(f"[{len(rows_out)}/{len(df)}] BLEU={bleu:.3f} SemSim={semsim:.3f} Faith={faith:.3f} Truth={truth:.3f} "
+                  f"CtxRecall={ctxrec:.3f} Recall@k={rec_k:.3f} MRR={mrr_v:.3f}")
+
+    # aggregate report
+    def mean(key: str) -> float:
+        vals = [r[key] for r in rows_out]
+        return float(np.mean(vals)) if vals else 0.0
+
     report = {
-        "eval_csv": os.path.basename(csv_path),
-        "count": int(len(df)),
+        "input": cfg.eval_csv,
+        "count": len(rows_out),
+        "means": {
+            "bleu": mean("bleu"),
+            "semantic_similarity": mean("semantic_similarity"),
+            "faithfulness": mean("faithfulness"),
+            "truthfulness": mean("truthfulness"),
+            "context_recall": mean("context_recall"),
+            "recall_at_k": mean("recall_at_k"),
+            "mrr": mean("mrr"),
+        },
+        "rows": rows_out,
         "config": {
-            "alpha": cfg.alpha,
-            "top_k": cfg.top_k,
-            "fetch_k": cfg.fetch_k,
-            "embedding_model": cfg.embedding_model,
-            "gguf_path": cfg.gguf_path,
-            "semantic_map_to_01": cfg.semantic_map_to_01,
+            "eval": asdict(cfg),
+            "rag": asdict(cfg.rag),
         },
-        "averages": {
-            "bleu": float(np.mean(bleu_list)) if bleu_list else 0.0,
-            "semantic_similarity": float(np.mean(semsim_list)) if semsim_list else 0.0,
-            "faithfulness": float(np.mean(faithful_scores)) if faithful_scores else 0.0,
-            "truthfulness": float(np.mean(truthful_scores)) if truthful_scores else 0.0,
-            "context_recall": float(np.mean(ctxrecall_scores)) if ctxrecall_scores else 0.0,
-            "recall@k": float(np.mean(recallk_list)) if recallk_list else 0.0,
-            "mrr": float(np.mean(mrr_list)) if mrr_list else 0.0,
-        },
-        "items": per_item,
     }
 
-    os.makedirs(os.path.dirname(cfg.out_report) or ".", exist_ok=True)
-    with open(cfg.out_report, "w", encoding="utf-8") as f:
+    with open(cfg.report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     print("\nEval done.")
-    print(f"- input : {csv_path}")
-    print(f"- report: {cfg.out_report}")
+    print(f"- input : {cfg.eval_csv}")
+    print(f"- report: {cfg.report_path}")
 
 
 if __name__ == "__main__":
-    main(parse_args())
+    nltk.download("punkt", quiet=True)
+    main()
