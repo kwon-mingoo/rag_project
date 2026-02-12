@@ -10,7 +10,7 @@
 ## 1) 폴더 구조 (상세)
 
 ```
-rag_project_v1/
+rag_project/
 ├─ main.py
 ├─ requirements.txt
 ├─ .env
