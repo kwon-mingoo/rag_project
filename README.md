@@ -212,3 +212,5 @@ Warning: You are sending unauthenticated requests to the HF Hub...
 ## 10) 라이선스/주의
 - 입력 PDF 및 생성 결과의 사용/배포는 각 문서의 저작권/공개 범위를 준수하세요.
 - 본 프로젝트는 “문서 근거 기반 답변”을 지향하지만, 최종 법적 판단은 전문가 검토가 필요합니다.
+
+## 11) 모듈화 X
