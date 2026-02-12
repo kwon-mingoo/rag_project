@@ -59,7 +59,7 @@ class EvalConfig:
 
     # judge settings (same model by default)
     judge_max_tokens: int = 2048   # 평가 토큰 수
-    judge_temperature: float = 0.0 # 평가 랜덤성 조절   
+    judge_temperature: float = 0.0 # 평가 랜덤성 조절 , 0.0 ~ 0.2
 
     # metric settings (통합 전 evaluate.py와 동일하게 맞추기)
     bleu_max_ngram: int = 4

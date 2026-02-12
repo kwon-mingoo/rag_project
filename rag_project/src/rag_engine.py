@@ -59,37 +59,213 @@ SYSTEM_PROMPT = """당신은 건설 관련 법령·행정 문서를 근거로
 """
 
 
-def build_user_prompt(question: str, context_blocks: str) -> str:
-    return f"""질문: {question}
+def build_user_prompt(
+    question: str,
+    context_blocks: str,
+    report_type: str = "review_report",
+    prompt_mode: str = "prod",
+) -> str:
+    """
+    Build a user prompt for the LLM.
 
-요청 사항:
+    report_type:
+      - review_report: 검토의견서(리포트)
+      - official_letter: 공문(안)
+      - qa_short: 간단 QA
+      - checklist: 체크리스트
+    prompt_mode:
+      - prod: 운영 리포트
+      - eval: 평가용(짧은 답)
+    """
 
-1) 컨텍스트에 근거하여,
-   가설울타리 계획변경 시 안전관리계획 수립 여부를
-   검토할 때 고려해야 할 기준·조건을
-   조건부 표현으로 bullet 형태로 정리하세요.
+    report_type = (report_type or "review_report").strip().lower()
+    prompt_mode = (prompt_mode or "prod").strip().lower()
 
-2) 각 기준 또는 조건마다
-   근거가 되는 문서명과 조항·페이지를 함께 제시하세요.
-   (법령 / 시행령 / 시행규칙 / 질의·회신 / 사례집 구분)
+    # 평가 모드에서는 짧은 QA로 강제, 바꿔주면 평가모드에서도 다르게 가능
+    if prompt_mode == "eval":
+        #report_type = "qa_short"
+        report_type = "checklist"
 
-3) 단독 가설울타리 설치와
-   다른 가설공사·고소작업·해체공사와 결합되는 경우를
-   구분하여 검토 포인트를 정리하세요.
-
-4) 종합 검토 의견(1~2문장):
-   - 본 사안이 안전관리계획 또는 관련 계획의
-     검토 대상으로 전환될 수 있는 조건을 요약하고,
-   - 추가로 확인이 필요한 핵심 정보를 제시하세요.
-   
-※ 주의:
-- 법적 판단 또는 행정 결론을 내리지 마세요.
-- 컨텍스트에 없는 내용은 포함하지 마세요.
-
-
+    # =========================================================
+    #  1. QA SHORT (평가/디버그용)
+    # =========================================================
+    if report_type == "qa_short":
+        return f"""[질의]
+{question}
 
 [컨텍스트]
 {context_blocks}
+
+[지시]
+- 컨텍스트 내용만 사용하세요.
+- 2~4문장으로 간결하게 답하세요.
+- 모든 주장 문장 끝에 반드시 출처 번호([1],[2]...)를 표시하세요.
+- 근거가 부족하면 '근거 부족'이라 명시하고 추가 질문을 작성하세요.
+
+[출력 형식]
+답변:
+근거:
+추가 질문(있는 경우):
+"""
+
+    # =========================================================
+    #  2. CHECKLIST (현장 실행형)
+    # =========================================================
+    if report_type == "checklist":
+        return f"""[역할]
+당신은 법령/기준 기반 현장 실행 체크리스트 작성자입니다.
+
+[질의]
+{question}
+
+[컨텍스트]
+{context_blocks}
+
+[절대 규칙]
+- 컨텍스트에 없는 사실을 단정하지 마세요.
+- 모든 항목 끝에 반드시 출처([1],[2]...)를 붙이세요.
+
+[작성 절차]
+1) 관련 근거를 5~15개 추출 (요약 + 출처)
+2) 필수(의무) / 권고(운영) 구분
+3) 체크리스트 작성
+
+[출력 형식]
+## 0) 근거 목록
+- ... [출처]
+
+## 1) 필수 요구사항 체크리스트
+- [ ] ... [출처]
+
+## 2) 권고 체크리스트
+- [ ] ... [출처]
+
+## 3) 근거 부족 / 추가 확인 질문
+- ...
+"""
+
+    # =========================================================
+    #  3. OFFICIAL LETTER (공문 특화 - 법령 QA 고도화)
+    # =========================================================
+    if report_type == "official_letter":
+        return f"""[역할]
+당신은 법령/기준 기반 공식 문서 작성자입니다.
+컨텍스트 근거만 사용하여 공문(안)을 작성하세요.
+
+[질의]
+{question}
+
+[컨텍스트]
+{context_blocks}
+
+[절대 규칙]
+- 컨텍스트에 없는 조항/수치/요건은 단정하지 마세요.
+- 모든 주장 문장 끝에 반드시 출처([1],[2]...) 표시.
+- 조항 인용이 필요한 경우 짧은 원문 발췌 포함.
+- 근거 부족은 별도 섹션으로 분리.
+
+[작성 절차]
+1) 근거 목록 추출 (요약 + 짧은 원문 발췌 + 출처)
+2) 필수/권고 요건 표 작성
+3) 위 표에 있는 내용만 사용해 공문 작성
+
+[출력 형식]
+## 0) 근거 목록(발췌)
+- (요약) "원문 일부..." [출처]
+
+## 1) 요건 정리
+| 구분 | 내용 | 근거 |
+|---|---|---|
+| 필수 | ... | [1] |
+| 권고 | ... | [2] |
+
+## 2) 공문(안)
+문서번호: (비워두기)
+시행일자: (비워두기)
+수    신: (비워두기)
+참    조: (비워두기)
+제    목: (질의 반영 제목)
+
+1. 배경 및 목적
+- ... [출처]
+
+2. 검토 결과
+- (필수) ... [출처]
+- (권고) ... [출처]
+
+3. 조치 요청 사항
+- (필수) ... [출처]
+- (권고) ... [출처]
+
+4. 유의사항 / 근거 부족
+- ...
+
+끝.
+"""
+
+    # =========================================================
+    #  4. REVIEW REPORT (검토의견서 - 법령 QA 최적화)
+    # =========================================================
+    return f"""[역할]
+당신은 법령/기준 준수 검토 의견서 작성자입니다.
+컨텍스트 근거만 사용합니다.
+
+[질의]
+{question}
+
+[컨텍스트]
+{context_blocks}
+
+[절대 규칙]
+- 컨텍스트에 없는 사실은 절대 단정하지 마세요.
+- 모든 판단/요건/리스크 문장 끝에 출처([1],[2]...) 표시.
+- 조항 인용이 중요하면 짧은 원문 발췌 포함.
+- 근거 부족은 별도 섹션에 명확히 기재.
+
+[작성 절차]
+1) 근거 5~15개 추출 (요약 + 발췌 + 출처)
+2) A/B 구분
+   A: 필수 의무사항
+   B: 권고/운영 체크포인트
+3) 리스크 도출 (법적/안전/품질/운영 구분)
+4) 우선순위 조치 제시
+
+[출력 형식]
+## 0) 근거 목록
+- (요약) "원문 일부..." [출처]
+
+## 1) A/B 요약
+### A. 필수(의무)
+- ... [출처]
+
+### B. 권고/운영
+- ... [출처]
+
+## 2) 결론
+- ... [출처]
+
+## 3) 적용 범위 및 전제
+- ... [출처 또는 근거 부족]
+
+## 4) 상세 검토 의견
+- 쟁점 1:
+  - 판단: ... [출처]
+  - 근거: ... [출처]
+- 쟁점 2:
+  - 판단: ... [출처]
+  - 근거: ... [출처]
+
+## 5) 리스크 및 권고 조치
+- (법적) ... [출처]
+- (안전) ... [출처]
+- (품질) ... [출처]
+- (운영) ... [출처]
+- P1: ... [출처]
+- P2: ... [출처]
+- P3: ... [출처]
+
+## 6) 근거 부족 / 추가 확인 질문
+- ...
 """
 
 
@@ -137,9 +313,6 @@ class RAGConfig:
     # LLM (llama.cpp)
     gguf_path: str = "/home/nami/Desktop/rag_project_v2/models/llama8b/Meta-Llama-3.1-8B-Instruct.Q8_0.gguf"
     chat_format: str = "llama-3"
-
-    # Prompt mode: 'prod' (템플릿) or 'eval' (짧은 QA, 지표 비교용)
-    prompt_mode: str = "prod"
     n_ctx: int = 8192
     max_tokens: int = 4096
     temperature: float = 0.2
@@ -149,6 +322,10 @@ class RAGConfig:
     n_batch: int = 512
 
 
+
+    # Prompt / Report
+    prompt_mode: str = "prod"   # prod|eval
+    report_type: str = "review_report"  # review_report|official_letter|qa_short|checklist
 # -----------------------------
 # VectorDB IO
 # -----------------------------
@@ -270,7 +447,21 @@ class HybridRetriever:
         return out
 
 
-def make_context_blocks(retrieved: Sequence[Tuple[Document, float, Dict[str, Any]]]) -> str:
+def make_context_blocks(retrieved):
+    # 완전 동일 텍스트만 제거
+    seen_txt = set()
+    uniq = []
+    for doc, score, dbg in retrieved:
+        txt = (doc.page_content or "").strip()
+        if not txt:
+            continue
+        if txt in seen_txt:
+            continue
+        seen_txt.add(txt)
+        uniq.append((doc, score, dbg))
+
+    retrieved = uniq
+
     blocks = []
     for i, (doc, _score, dbg) in enumerate(retrieved, start=1):
         src = dbg.get("source_basename") or dbg.get("source") or "UNKNOWN"
@@ -279,6 +470,7 @@ def make_context_blocks(retrieved: Sequence[Tuple[Document, float, Dict[str, Any
         txt = doc.page_content.strip()
         blocks.append(f"[{i}] ({src} p.{page}, chunk_id={chunk_id})\n{txt}\n")
     return "\n".join(blocks).strip()
+
 
 
 # -----------------------------
@@ -297,15 +489,6 @@ def build_llama(cfg: RAGConfig) -> Llama:
     if cfg.n_threads and int(cfg.n_threads) > 0:
         kwargs["n_threads"] = int(cfg.n_threads)
     return Llama(**kwargs)
-
-
-def build_user_input(question: str, context_blocks: str) -> str:
-    """Evaluation-friendly short QA prompt (used in 통합 전 evaluate.py).
-    - keeps answers short
-    - encourages citation like [1],[2]
-    """
-    return f"""질문:\n{question}\n\n컨텍스트:\n{context_blocks}\n\n요청:\n- 반드시 컨텍스트 근거로만 답변\n- 가능하면 [1],[2] 출처 표시\n"""
-
 
 
 def llama_chat(
@@ -362,26 +545,10 @@ def retrieve(resources: RAGResources, query: str, alpha: Optional[float] = None,
     )
 
 
-def generate(
-    resources: RAGResources,
-    query: str,
-    retrieved,
-    system_prompt: Optional[str] = None,
-    prompt_mode: Optional[str] = None,
-):
-    """Generate answer.
-
-    prompt_mode:
-      - 'prod': 운영 템플릿(build_user_prompt)
-      - 'eval': 통합 전 evaluate.py 스타일(build_user_input)
-    """
+def generate(resources: RAGResources, query: str, retrieved, system_prompt: Optional[str] = None):
     cfg = resources.cfg
     ctx = make_context_blocks(retrieved)
-    mode = (prompt_mode or getattr(cfg, 'prompt_mode', 'prod')).lower()
-    if mode == 'eval':
-        user_prompt = build_user_input(query, ctx)
-    else:
-        user_prompt = build_user_prompt(query, ctx)
+    user_prompt = build_user_prompt(query, ctx, report_type=getattr(cfg, 'report_type', 'review_report'), prompt_mode=getattr(cfg, 'prompt_mode', 'prod'))
     answer = llama_chat(
         resources.llm,
         system_prompt or SYSTEM_PROMPT,
@@ -393,15 +560,7 @@ def generate(
     return answer, ctx, user_prompt
 
 
-def answer_query(
-    resources: RAGResources,
-    query: str,
-    alpha: Optional[float] = None,
-    top_k: Optional[int] = None,
-    fetch_k: Optional[int] = None,
-    system_prompt: Optional[str] = None,
-    prompt_mode: Optional[str] = None,
-):
+def answer_query(resources: RAGResources, query: str, alpha: Optional[float] = None, top_k: Optional[int] = None, fetch_k: Optional[int] = None, system_prompt: Optional[str] = None):
     retrieved = retrieve(resources, query, alpha=alpha, top_k=top_k, fetch_k=fetch_k)
-    answer, ctx, user_prompt = generate(resources, query, retrieved, system_prompt=system_prompt, prompt_mode=prompt_mode)
+    answer, ctx, user_prompt = generate(resources, query, retrieved, system_prompt=system_prompt)
     return answer, retrieved, ctx, user_prompt

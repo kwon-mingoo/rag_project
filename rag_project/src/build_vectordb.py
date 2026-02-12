@@ -17,7 +17,7 @@ VectorDB/
   - faiss.index
   - config.json
 """
-
+import re
 import os
 import glob
 import json
@@ -43,6 +43,20 @@ except ImportError as e:
     raise ImportError("FAISS가 필요합니다. (conda install -c pytorch faiss-gpu) 또는 (pip faiss-cpu)") from e
 
 from rag_engine import RAGConfig, tokenize_ko_en
+
+
+def clean_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    # 줄바꿈 과다 정리
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # OCR/추출 깨짐: 같은 단어/구가 줄바꿈으로 반복되는 패턴 완화
+    # 예) "안전관리비\n안전관리비\n안전관리비" -> "안전관리비"
+    text = re.sub(r"(\b[가-힣A-Za-z0-9]{2,}\b)(\s*\n\s*\1){1,}", r"\1", text) # 검색 성능 떨어지면 이 부분 완화
+
+    # 공백 정리
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
 
 def load_pdf_pages(pdf_path: str) -> List[Tuple[int, str]]:
@@ -75,6 +89,7 @@ def build_documents(cfg: RAGConfig) -> List[Document]:
     for pdf in pdfs:
         pages = load_pdf_pages(pdf)
         for page_idx, text in pages:
+            text = clean_text(text)
             chunks = splitter.split_text(text)
             for ch in chunks:
                 ch = ch.strip()
