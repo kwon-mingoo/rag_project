@@ -177,7 +177,7 @@ python src/evaluate.py --max_rows 50 --debug_n 3
 
 ```gitignore
 # 모델(매우 큼)
-models/**/*.gguf
+models/
 
 # VectorDB 캐시(필요시 제외)
 VectorDB/
