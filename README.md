@@ -1,10 +1,9 @@
 # Construction Safety Hybrid RAG (BM25 + FAISS + llama.cpp)
 
 건설 안전/법령 PDF들을 대상으로 **BM25 + FAISS(Vector) 하이브리드 검색**을 수행하고,  
-로컬 GGUF 모델(**Meta-Llama-3.1-8B-Instruct.Q8_0.gguf**)을 **llama.cpp(=llama-cpp-python)**로 직접 구동해 답변을 생성하는 프로젝트입니다.
+로컬 GGUF 모델(Meta-Llama-3.1-8B-Instruct.Q8_0.gguf)을 llama.cpp(=llama-cpp-python)로 직접 구동해 답변을 생성하는 프로젝트입니다.
 
-> ✅ 모델(GGUF)은 용량이 커서 GitHub에 포함하지 않는 것을 전제로 합니다.  
-> `models/` 폴더에 모델을 내려받아 넣고, `src/evaluate.py`의 `gguf_path`만 맞추면 바로 실행됩니다.
+ `models/` 폴더에 모델을 내려받아 넣고, `src/evaluate.py`의 `gguf_path`만 맞추면 바로 실행됩니다.
 
 ---
 
@@ -191,8 +190,6 @@ __pycache__/
 .venv/
 ```
 
-> 팀 공유 목적이라면 `VectorDB/`는 커밋해도 되지만,  
-> 문서량이 늘어나면 빠르게 커지므로 “재생성 가능”하게 두는 편을 추천합니다.
 
 ---
 
