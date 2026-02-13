@@ -26,7 +26,7 @@ if ROOT_DIR not in sys.path:
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-import rag_engine_fixed as eng  # noqa: E402
+import rag_engine as eng  # noqa: E402
 
 
 def vectordb_ready(vdb_dir: str) -> bool:

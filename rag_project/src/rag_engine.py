@@ -302,9 +302,9 @@ class RAGConfig:
 
     # Embeddings / Retrieval
     embedding_model: str = "BAAI/bge-m3"
-    alpha: float = 0.5      # 0~1 (vec:alpha, bm25:1-alpha)
+    alpha: float = 0.55      # 0~1 (vec:alpha, bm25:1-alpha)
     top_k: int = 6
-    fetch_k: int = 60       # 후보 풀
+    fetch_k: int = 40       # 후보 풀
 
     # Chunking (build_vectordb에서 사용)
     chunk_size: int = 800
@@ -326,6 +326,25 @@ class RAGConfig:
     # Prompt / Report
     prompt_mode: str = "prod"   # prod|eval
     report_type: str = "review_report"  # review_report|official_letter|qa_short|checklist
+
+def get_retriever_signature(cfg: "RAGConfig") -> str:
+    # “지표가 바뀌는 원인”이 되는 요소만 담기 (경로는 넣지 않기)
+    parts = [
+        "retriever=hybrid(bm25+faiss)",
+        f"alpha={cfg.alpha}",
+        f"top_k={cfg.top_k}",
+        f"fetch_k={cfg.fetch_k}",
+        f"embedding_model={cfg.embedding_model}",
+        # 아래는 구현/정책을 명시 (너의 build_vectordb / rag_engine 정책에 맞게 고정)
+        "faiss_index=IndexFlatIP",
+        "doc_embed_norm=normalize_embeddings=True",
+        "query_embed_norm=normalize_embeddings=True",  # 또는 faiss.normalize_L2
+        "bm25_tokenizer=_RE_WORD:v1",
+        "hybrid_norm=minmax",
+        "hybrid_norm_scope=candidates_union",  # 또는 "all_docs"
+    ]
+    return "|".join(parts)
+
 # -----------------------------
 # VectorDB IO
 # -----------------------------
@@ -364,22 +383,11 @@ class HybridRetriever:
         self.index = index
         self.embed_model = embed_model
 
-    def _vector_search(self, query: str, fetch_k: int) -> Tuple[np.ndarray, np.ndarray]:
-        qv = self.embed_model.encode([query], normalize_embeddings=True)
-        qv = np.asarray(qv, dtype=np.float32)
-        scores, idxs = self.index.search(qv, fetch_k)
-        return scores[0], idxs[0]
-
-    def _bm25_search(self, query: str, fetch_k: int) -> Tuple[np.ndarray, np.ndarray]:
-        q_tokens = tokenize_ko_en(query)
-        scores = np.asarray(self.bm25.get_scores(q_tokens), dtype=np.float32)
-        # top fetch_k indices
-        if fetch_k >= scores.shape[0]:
-            idxs = np.argsort(-scores)
-        else:
-            idxs = np.argpartition(-scores, fetch_k)[:fetch_k]
-            idxs = idxs[np.argsort(-scores[idxs])]
-        return scores[idxs], idxs.astype(np.int64)
+    def embed_query(self, q: str) -> np.ndarray:
+        # 통합 전 evaluate.py와 동일: normalize_embeddings=False 후 L2 normalize
+        v = self.embed_model.encode([q], convert_to_numpy=True, normalize_embeddings=False).astype(np.float32)
+        faiss.normalize_L2(v)
+        return v
 
     def retrieve(
         self,
@@ -388,64 +396,52 @@ class HybridRetriever:
         top_k: int,
         fetch_k: int,
     ) -> List[Tuple[Document, float, Dict[str, Any]]]:
-        alpha = float(alpha)
-        alpha = max(0.0, min(1.0, alpha))
+        """통합 전 evaluate.py와 동일한 하이브리드 검색.
+        - BM25: 전체 문서 점수 -> minmax
+        - FAISS: fetch_k 후보 점수 -> 전체 길이 벡터에 채움 -> minmax
+        - hybrid = alpha*vec + (1-alpha)*bm25
+        """
+        alpha = float(max(0.0, min(1.0, float(alpha))))
         top_k = int(top_k)
         fetch_k = int(fetch_k)
 
-        vec_scores, vec_idxs = self._vector_search(query, fetch_k)
-        bm_scores, bm_idxs = self._bm25_search(query, fetch_k)
+        # BM25 over all docs
+        q_tokens = tokenize_ko_en(query)
+        bm25_scores = np.asarray(self.bm25.get_scores(q_tokens), dtype=np.float32)
+        bm25_n = minmax_norm(bm25_scores)
 
-        # Candidate union
-        cand = {}
-        for s, i in zip(vec_scores, vec_idxs):
-            if i < 0:
-                continue
-            cand[int(i)] = {"vec": float(s), "bm25": 0.0}
-        for s, i in zip(bm_scores, bm_idxs):
-            i = int(i)
-            if i not in cand:
-                cand[i] = {"vec": 0.0, "bm25": float(s)}
-            else:
-                cand[i]["bm25"] = float(s)
+        # FAISS
+        qv = self.embed_query(query)
+        sim, idx = self.index.search(qv, fetch_k)
+        sim = sim[0].astype(np.float32)
+        idx = idx[0].astype(np.int64)
 
-        # Normalize within candidates
-        vec_arr = np.array([cand[i]["vec"] for i in cand.keys()], dtype=np.float32)
-        bm_arr = np.array([cand[i]["bm25"] for i in cand.keys()], dtype=np.float32)
-        vec_n = minmax_norm(vec_arr)
-        bm_n = minmax_norm(bm_arr)
+        vec_scores = np.zeros(len(self.docs), dtype=np.float32)
+        mask = idx >= 0
+        vec_scores[idx[mask]] = sim[mask]
+        vec_n = minmax_norm(vec_scores)
 
-        keys = list(cand.keys())
-        out = []
-        for j, i in enumerate(keys):
-            hybrid = alpha * float(vec_n[j]) + (1.0 - alpha) * float(bm_n[j])
-            cand[i]["hybrid"] = hybrid
-            cand[i]["vec_n"] = float(vec_n[j])
-            cand[i]["bm25_n"] = float(bm_n[j])
+        # Hybrid
+        hybrid = alpha * vec_n + (1.0 - alpha) * bm25_n
+        top_idx = np.argsort(-hybrid)[:top_k]
 
-        # sort by hybrid
-        keys.sort(key=lambda i: cand[i]["hybrid"], reverse=True)
-        keys = keys[:top_k]
-
-        for rank, i in enumerate(keys, start=1):
-            d = self.docs[i]
+        results: List[Tuple[Document, float, Dict[str, Any]]] = []
+        for rank_i, i in enumerate(top_idx, start=1):
+            d = self.docs[int(i)]
             meta = d.metadata or {}
             dbg = {
-                "rank": rank,
-                "doc_index": i,
+                "rank": rank_i,
+                "doc_index": int(i),
                 "chunk_id": meta.get("chunk_id"),
                 "page": meta.get("page"),
                 "source": meta.get("source"),
-                "source_basename": os.path.basename(meta.get("source", "")) if meta.get("source") else meta.get("source_basename"),
-                "hybrid": cand[i]["hybrid"],
-                "bm25": cand[i]["bm25"],
-                "vec": cand[i]["vec"],
-                "bm25_n": cand[i]["bm25_n"],
-                "vec_n": cand[i]["vec_n"],
+                "source_basename": os.path.basename(str(meta.get("source", ""))) if meta.get("source") else meta.get("source_basename"),
+                "hybrid": float(hybrid[int(i)]),
+                "bm25": float(bm25_scores[int(i)]),
+                "vec": float(vec_scores[int(i)]),
             }
-            out.append((d, cand[i]["hybrid"], dbg))
-        return out
-
+            results.append((d, float(hybrid[int(i)]), dbg))
+        return results
 
 def make_context_blocks(retrieved):
     # 완전 동일 텍스트만 제거

@@ -66,7 +66,7 @@ def main():
     if args.fetch_k is not None:
         cfg.fetch_k = int(args.fetch_k)
 
-    # ✅ report/prompt settings
+    # report/prompt settings
     cfg.report_type = args.report
     cfg.prompt_mode = args.prompt_mode
 

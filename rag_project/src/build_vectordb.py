@@ -168,7 +168,7 @@ def main():
     with open(os.path.join(cfg.vectordb_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg_dump, f, ensure_ascii=False, indent=2)
 
-    print("✅ Done.")
+    print("Done.")
     print(f"- VectorDB: {cfg.vectordb_dir}")
     print(f"- Files   : docs.pkl / bm25.pkl / faiss.index / config.json")
 
