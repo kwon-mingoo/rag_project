@@ -2,11 +2,11 @@
   "vectordb_dir": "VectorDB",
   "data_dir": "data",
   "embedding_model": "BAAI/bge-m3",
-  "alpha": 0.5,
+  "alpha": 0.55,
   "top_k": 6,
-  "fetch_k": 60,
-  "chunk_size": 800,
-  "chunk_overlap": 120,
+  "fetch_k": 150,
+  "chunk_size": 1400,
+  "chunk_overlap": 250,
   "gguf_path": "/home/nami/Desktop/rag_project_v2/models/llama8b/Meta-Llama-3.1-8B-Instruct.Q8_0.gguf",
   "chat_format": "llama-3",
   "n_ctx": 8192,
@@ -15,5 +15,10 @@
   "top_p": 0.95,
   "n_gpu_layers": -1,
   "n_threads": 0,
-  "n_batch": 512
+  "n_batch": 512,
+  "mmr_enabled": true,
+  "mmr_lambda": 0.7,
+  "mmr_candidates": 80,
+  "prompt_mode": "prod",
+  "report_type": "review_report"
 }

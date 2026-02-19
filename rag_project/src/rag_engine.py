@@ -14,6 +14,8 @@ rag_engine.py
 
 from __future__ import annotations
 
+
+
 import os
 import json
 import pickle
@@ -38,6 +40,7 @@ try:
 except Exception as e:
     raise ImportError("llama-cpp-python이 필요합니다. (pip install llama-cpp-python)") from e
 
+from collections import defaultdict
 
 # -----------------------------
 # Prompts
@@ -304,11 +307,11 @@ class RAGConfig:
     embedding_model: str = "BAAI/bge-m3"
     alpha: float = 0.55      # 0~1 (vec:alpha, bm25:1-alpha)
     top_k: int = 6
-    fetch_k: int = 40       # 후보 풀
+    fetch_k: int = 150 #40       # 후보 풀
 
     # Chunking (build_vectordb에서 사용)
-    chunk_size: int = 800
-    chunk_overlap: int = 120
+    chunk_size: int = 1400 #800
+    chunk_overlap: int = 250 # 120
 
     # LLM (llama.cpp)
     gguf_path: str = "/home/nami/Desktop/rag_project_v2/models/llama8b/Meta-Llama-3.1-8B-Instruct.Q8_0.gguf"
@@ -321,7 +324,9 @@ class RAGConfig:
     n_threads: int = 0       # 0이면 llama.cpp 기본값
     n_batch: int = 512
 
-
+    mmr_enabled: bool = True
+    mmr_lambda: float = 0.7          # 0.6~0.8 추천
+    mmr_candidates: int = 80         # 후보에서 MMR 적용할 개수 
 
     # Prompt / Report
     prompt_mode: str = "prod"   # prod|eval
@@ -335,7 +340,7 @@ def get_retriever_signature(cfg: "RAGConfig") -> str:
         f"top_k={cfg.top_k}",
         f"fetch_k={cfg.fetch_k}",
         f"embedding_model={cfg.embedding_model}",
-        # 아래는 구현/정책을 명시 (너의 build_vectordb / rag_engine 정책에 맞게 고정)
+        # 아래는 구현/정책을 명시 (build_vectordb / rag_engine 정책에 맞게 고정)
         "faiss_index=IndexFlatIP",
         "doc_embed_norm=normalize_embeddings=True",
         "query_embed_norm=normalize_embeddings=True",  # 또는 faiss.normalize_L2
@@ -372,6 +377,56 @@ def load_vectordb(vectordb_dir: str) -> Tuple[Any, List[Document], Any]:
     index = faiss.read_index(index_path)
     return index, docs, bm25
 
+#MMR
+def mmr_select(
+    candidate_idxs,
+    relevance_scores,   # dict: idx -> rel_score (float)
+    get_vec,            # function idx -> vector (np.ndarray) or None
+    top_k: int,
+    lambda_: float = 0.7,
+):
+    selected = []
+    selected_vecs = []
+
+    # 미리 후보 벡터 확보 (없으면 그 후보는 다양성 계산에서 불리/불가)
+    cand_vecs = {}
+    for i in candidate_idxs:
+        v = get_vec(i)
+        if v is not None:
+            cand_vecs[i] = v
+
+    while len(selected) < top_k and candidate_idxs:
+        best = None
+        best_score = -1e9
+
+        for i in candidate_idxs:
+            rel = relevance_scores.get(i, 0.0)
+
+            # 다양성 항: 선택된 것들과의 최대 유사도(없으면 0)
+            div = 0.0
+            vi = cand_vecs.get(i)
+            if vi is not None and selected_vecs:
+                # cosine (IndexFlatIP + 정규화면 dot = cosine)
+                sims = [float(np.dot(vi, vj)) for vj in selected_vecs]
+                div = max(sims) if sims else 0.0
+
+            score = lambda_ * rel - (1.0 - lambda_) * div
+            if score > best_score:
+                best_score = score
+                best = i
+
+        if best is None:
+            break
+
+        selected.append(best)
+        if best in cand_vecs:
+            selected_vecs.append(cand_vecs[best])
+        candidate_idxs.remove(best)
+
+    return selected
+
+
+
 
 # -----------------------------
 # Retriever
@@ -395,6 +450,9 @@ class HybridRetriever:
         alpha: float,
         top_k: int,
         fetch_k: int,
+        mmr_enabled: bool = False,
+        mmr_candidates: int = 80,
+        mmr_lambda: float = 0.7,
     ) -> List[Tuple[Document, float, Dict[str, Any]]]:
         """통합 전 evaluate.py와 동일한 하이브리드 검색.
         - BM25: 전체 문서 점수 -> minmax
@@ -423,49 +481,94 @@ class HybridRetriever:
 
         # Hybrid
         hybrid = alpha * vec_n + (1.0 - alpha) * bm25_n
-        top_idx = np.argsort(-hybrid)[:top_k]
 
-        results: List[Tuple[Document, float, Dict[str, Any]]] = []
-        for rank_i, i in enumerate(top_idx, start=1):
-            d = self.docs[int(i)]
-            meta = d.metadata or {}
+        # 후보를 넉넉히 확보
+        cand_n = max(top_k, int(mmr_candidates))
+        top_idx = np.argsort(-hybrid)[:cand_n]
+
+        # MMR rerank 적용 (중복 억제 + 다양성)
+        if bool(mmr_enabled) and len(top_idx) > top_k:
+            rel_map = {int(i): float(hybrid[int(i)]) for i in top_idx}
+
+            def _get_vec(doc_i: int):
+                try:
+                    v = self.index.reconstruct(int(doc_i))
+                    v = np.asarray(v, dtype=np.float32)
+                    n = np.linalg.norm(v) + 1e-12
+                    return v / n
+                except Exception:
+                    return None
+
+            cand = [int(i) for i in top_idx.tolist()]
+            picked = mmr_select(
+                cand, rel_map, _get_vec,
+                top_k=top_k, lambda_=float(mmr_lambda)
+            )
+            top_idx = np.asarray(picked, dtype=np.int64)
+        else:
+            top_idx = top_idx[:top_k]
+
+        # retrieved 구성 + dbg 생성 + return
+        retrieved: List[Tuple[Document, float, Dict[str, Any]]] = []
+        for i in top_idx:
+            ii = int(i)
+            doc = self.docs[ii]
+            score = float(hybrid[ii])
+
+            meta = getattr(doc, "metadata", {}) or {}
             dbg = {
-                "rank": rank_i,
-                "doc_index": int(i),
-                "chunk_id": meta.get("chunk_id"),
+                "doc_i": ii,
+                "source": meta.get("source", ""),
+                "source_basename": meta.get("source_basename", meta.get("source", "")),
                 "page": meta.get("page"),
-                "source": meta.get("source"),
-                "source_basename": os.path.basename(str(meta.get("source", ""))) if meta.get("source") else meta.get("source_basename"),
-                "hybrid": float(hybrid[int(i)]),
-                "bm25": float(bm25_scores[int(i)]),
-                "vec": float(vec_scores[int(i)]),
+                "chunk_id": meta.get("chunk_id", ii),
+                "bm25_n": float(bm25_n[ii]),
+                "vec_n": float(vec_n[ii]),
+                "hybrid": score,
             }
-            results.append((d, float(hybrid[int(i)]), dbg))
-        return results
+            retrieved.append((doc, score, dbg))
 
-def make_context_blocks(retrieved):
-    # 완전 동일 텍스트만 제거
+        return retrieved
+
+
+
+def make_context_blocks(retrieved, max_per_page: int = 2):
+    """
+    Build context blocks from retrieved [(doc, score, dbg), ...]
+    while limiting redundancy per (source,page).
+    """
+    per_page = defaultdict(int)
     seen_txt = set()
-    uniq = []
+    kept = []
+
     for doc, score, dbg in retrieved:
         txt = (doc.page_content or "").strip()
         if not txt:
             continue
+        # exact-dup 제거
         if txt in seen_txt:
             continue
-        seen_txt.add(txt)
-        uniq.append((doc, score, dbg))
 
-    retrieved = uniq
+        src = dbg.get("source_basename") or dbg.get("source") or ""
+        page = dbg.get("page")
+        key = (src, page)
+
+        # 같은 (문서,페이지)에서 너무 많이 뽑히는 것 제한
+        if per_page[key] >= max_per_page:
+            continue
+
+        per_page[key] += 1
+        seen_txt.add(txt)
+        kept.append((doc, score, dbg))
 
     blocks = []
-    for i, (doc, _score, dbg) in enumerate(retrieved, start=1):
-        src = dbg.get("source_basename") or dbg.get("source") or "UNKNOWN"
+    for doc, score, dbg in kept:
+        src = dbg.get("source_basename") or dbg.get("source") or "unknown"
         page = dbg.get("page")
-        chunk_id = dbg.get("chunk_id")
-        txt = doc.page_content.strip()
-        blocks.append(f"[{i}] ({src} p.{page}, chunk_id={chunk_id})\n{txt}\n")
-    return "\n".join(blocks).strip()
+        blocks.append(
+            f"[source={src} | page={page} | score={score:.4f}]\n{doc.page_content}"
+        )
+    return "\n\n---\n\n".join(blocks)
 
 
 
@@ -526,7 +629,7 @@ def load_resources(cfg: Optional[RAGConfig] = None) -> RAGResources:
     cfg = cfg or RAGConfig()
     index, docs, bm25 = load_vectordb(cfg.vectordb_dir)
     embed_model = SentenceTransformer(cfg.embedding_model)
-    llm = build_llama(cfg)
+    llm = build_llama(cfg) 
     retriever = HybridRetriever(docs, bm25, index, embed_model)
     return RAGResources(cfg, index, docs, bm25, embed_model, llm, retriever)
 
@@ -538,6 +641,9 @@ def retrieve(resources: RAGResources, query: str, alpha: Optional[float] = None,
         cfg.alpha if alpha is None else float(alpha),
         cfg.top_k if top_k is None else int(top_k),
         cfg.fetch_k if fetch_k is None else int(fetch_k),
+        mmr_enabled=cfg.mmr_enabled,
+        mmr_candidates=cfg.mmr_candidates,
+        mmr_lambda=cfg.mmr_lambda,
     )
 
 
