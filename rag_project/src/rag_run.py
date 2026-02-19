@@ -7,7 +7,7 @@ rag_run.py
 
 사용 예)
   python src/rag_run.py --query "산업안전보건기준에 관한 규칙 제291조는?" --show_topk
-  python src/rag_run.py --query "..." --report official_letter
+  python src/rag_run.py --query "..." --report doc_draft
 """
 
 import os
@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_k", type=int, default=None, help="Top-k override")
     p.add_argument("--fetch_k", type=int, default=None, help="Fetch-k override")
 
+    # MMR overrides (optional but recommended)
+    p.add_argument("--mmr", action="store_true", help="MMR 강제 ON (cfg 기본값 override)")
+    p.add_argument("--mmr_candidates", type=int, default=None, help="MMR 후보 수 override")
+    p.add_argument("--mmr_lambda", type=float, default=None, help="MMR lambda override (0~1)")
+
     # Output controls
     p.add_argument("--show_context", action="store_true", help="검색 컨텍스트(Top-k) 전문을 출력")
     p.add_argument("--show_topk", action="store_true", help="Top-k 메타정보(문서/페이지/스코어) 출력")
@@ -39,11 +44,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--report",
         type=str,
-        default="review_report",
-        choices=["review_report", "official_letter", "checklist", "qa_short"],
+        default="doc_draft",
+        choices=["review_report", "official_letter", "checklist", "qa_short", "doc_draft"],
         help="출력 문서 형식 선택",
     )
-    # 필요하면 CLI에서 eval/prod도 바꿀 수 있게 열어둠(기본 prod)
     p.add_argument(
         "--prompt_mode",
         type=str,
@@ -70,6 +74,14 @@ def main():
     cfg.report_type = args.report
     cfg.prompt_mode = args.prompt_mode
 
+    # MMR settings
+    if args.mmr:
+        cfg.mmr_enabled = True
+    if args.mmr_candidates is not None:
+        cfg.mmr_candidates = int(args.mmr_candidates)
+    if args.mmr_lambda is not None:
+        cfg.mmr_lambda = float(args.mmr_lambda)
+
     # Load shared resources once (docs/bm25/faiss/embed/llm/retriever)
     res = eng.load_resources(cfg)
 
@@ -77,20 +89,22 @@ def main():
     print("[QUERY]")
     print(args.query)
 
-    # Retrieve
-    retrieved = res.retriever.retrieve(args.query, cfg.alpha, cfg.top_k, cfg.fetch_k)
-    context_blocks = eng.make_context_blocks(retrieved)
+    # ✅ 통합 엔진 단일 진입점
+    # retrieve → make_context_blocks → build_user_prompt(report_type/prompt_mode) → generate
+    answer, retrieved, context_blocks, user_prompt = eng.answer_query(res, args.query)
 
-    # Show retrieval
+    # Show retrieval (dbg 키 엔진 기준으로 맞춤)
     if args.show_topk:
         print("\n[TOP-K Retrieved]")
-        for (_d, _s, dbg) in retrieved:
+        for rank, (_d, _s, dbg) in enumerate(retrieved, start=1):
+            # dbg에는 rank가 없으니 rank는 enumerate로 계산
             print(
-                f" rank={dbg.get('rank')} src={dbg.get('source_basename')} page={dbg.get('page')} "
+                f" rank={rank} src={dbg.get('source_basename')} page={dbg.get('page')} "
                 f"chunk={dbg.get('chunk_id')} hybrid={dbg.get('hybrid'):.3f} "
-                f"bm25={dbg.get('bm25'):.2f} vec={dbg.get('vec'):.3f}"
+                f"bm25_n={dbg.get('bm25_n'):.3f} vec_n={dbg.get('vec_n'):.3f}"
             )
 
+    # Context output
     if args.show_context:
         print("\n[CONTEXT BLOCKS]\n")
         print(context_blocks)
@@ -99,26 +113,8 @@ def main():
         for i, (dd, _s, dbg) in enumerate(retrieved, start=1):
             src = dbg.get("source_basename")
             page = dbg.get("page")
-            prev = dd.page_content[: args.max_context_chars].replace("\n", " ")
+            prev = (dd.page_content or "")[: args.max_context_chars].replace("\n", " ")
             print(f"[{i}] {src} p.{page} chunk={dbg.get('chunk_id')} :: {prev}\n")
-
-    # Build prompt (report_type 반영)
-    user_prompt = eng.build_user_prompt(
-        args.query,
-        context_blocks,
-        report_type=cfg.report_type,
-        prompt_mode=cfg.prompt_mode,
-    )
-
-    # Generate (reuse res.llm)
-    answer = eng.llama_chat(
-        res.llm,
-        eng.SYSTEM_PROMPT,
-        user_prompt,
-        max_tokens=cfg.max_tokens,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-    )
 
     print("\n" + "=" * 90)
     print("[ANSWER]\n")

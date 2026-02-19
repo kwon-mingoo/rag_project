@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fetch_k", type=int, default=None, help="Fetch-k override")
     p.add_argument("--show_topk", action="store_true", help="각 질의마다 Top-k 메타를 출력")
     p.add_argument("--show_context", action="store_true", help="각 질의마다 컨텍스트 전문 출력")
+    p.add_argument(
+        "--report_type",
+        type=str,
+        default="doc_draft",
+        choices=["review_report", "official_letter", "qa_short", "checklist", "doc_draft"],
+        help="출력 문서 타입",
+    )
+    
     return p.parse_args()
 
 
@@ -76,8 +84,10 @@ def main():
         cfg.fetch_k = int(args.fetch_k)
 
     res = eng.load_resources(cfg)
-    retriever = eng.HybridRetriever(res.docs, res.bm25, res.index, res.embed_model)
-    llm = eng.build_llama(cfg)
+    if args.report_type:
+        res.cfg.report_type = args.report_type
+    #retriever = eng.HybridRetriever(res.docs, res.bm25, res.index, res.embed_model)
+    #llm = eng.build_llama(cfg)
 
     print("\n" + "=" * 90)
     print("RAG 질의 모드입니다. 종료하려면 exit/quit 입력")
@@ -96,30 +106,22 @@ def main():
             print("종료합니다.")
             break
 
-        retrieved = retriever.retrieve(q, cfg.alpha, cfg.top_k, cfg.fetch_k)
-        context_blocks = eng.make_context_blocks(retrieved)
+        # 엔진 통합 호출 (retrieve → context → prompt → generate)
+        answer, retrieved, ctx, user_prompt = eng.answer_query(res, q)
 
+        # 디버그 출력(현재 rag_engine dbg 키에 맞춤)
         if args.show_topk:
             print("\n[TOP-K Retrieved]")
-            for (dd, _s, dbg) in retrieved:
+            for rank, (dd, _s, dbg) in enumerate(retrieved, start=1):
                 print(
-                    f" rank={dbg['rank']} src={dbg['source_basename']} page={dbg['page']} "
-                    f"chunk={dbg['chunk_id']} hybrid={dbg['hybrid']:.3f} bm25={dbg['bm25']:.2f} vec={dbg['vec']:.3f}"
+                    f" rank={rank} src={dbg.get('source_basename')} page={dbg.get('page')} "
+                    f"chunk={dbg.get('chunk_id')} hybrid={dbg.get('hybrid'):.3f} "
+                    f"bm25_n={dbg.get('bm25_n'):.3f} vec_n={dbg.get('vec_n'):.3f}"
                 )
 
         if args.show_context:
             print("\n[CONTEXT BLOCKS]\n")
-            print(context_blocks)
-
-        user_prompt = eng.build_user_prompt(q, context_blocks)
-        answer = eng.llama_chat(
-            llm,
-            eng.SYSTEM_PROMPT,
-            user_prompt,
-            max_tokens=cfg.max_tokens,
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-        )
+            print(ctx)
 
         print("\n" + "-" * 90)
         print(answer.strip())
