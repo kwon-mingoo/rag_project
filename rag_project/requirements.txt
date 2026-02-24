@@ -16,3 +16,10 @@ llama-cpp-python   # 핵심: 로컬 LLM 구동 엔진
 #conda install -c pytorch -c nvidia faiss-gpu=1.8.0 진행 필수
 #faiss-gpu          # GPU로 벡터 검색 가속 (Linux/WSL) 또는 faiss-cpu (Windows)
 # pip install --no-cache-dir -r requirements.txt 캐시 없이 설치
+
+
+rank_bm25 # bm25
+pandas
+nltk
+
+pymupdf
