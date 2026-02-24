@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
         "--report_type",
         type=str,
         default="doc_draft",
-        choices=["review_report", "official_letter", "qa_short", "checklist", "doc_draft"],
+        choices=["review_report", "official_letter", "qa_short", "doc_draft"],
         help="출력 문서 타입",
     )
     

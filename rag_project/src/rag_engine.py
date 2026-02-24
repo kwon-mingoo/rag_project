@@ -14,13 +14,13 @@ rag_engine.py
 
 from __future__ import annotations
 
-
+#from dataclasses import field
 
 import os
 import json
 import pickle
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -75,7 +75,7 @@ def build_user_prompt(
       - review_report: 검토의견서(리포트)
       - official_letter: 공문(안)
       - qa_short: 간단 QA
-      - checklist: 체크리스트
+      - doc_draft: 문서 생성형
     prompt_mode:
       - prod: 운영 리포트
       - eval: 평가용(짧은 답)
@@ -87,7 +87,7 @@ def build_user_prompt(
     # 평가 모드에서는 짧은 QA로 강제, 바꿔주면 평가모드에서도 다르게 가능
     if prompt_mode == "eval":
         report_type = "qa_short"
-        #report_type = "checklist"
+        
 
     # =========================================================
     #  1. QA SHORT (평가/디버그용)
@@ -111,45 +111,9 @@ def build_user_prompt(
 추가 질문(있는 경우):
 """
 
-    # =========================================================
-    #  2. CHECKLIST (현장 실행형)
-    # =========================================================
-    if report_type == "checklist":
-        return f"""[역할]
-당신은 법령/기준 기반 현장 실행 체크리스트 작성자입니다.
-
-[질의]
-{question}
-
-[컨텍스트]
-{context_blocks}
-
-[절대 규칙]
-- 컨텍스트에 없는 사실을 단정하지 마세요.
-- 모든 항목 끝에 반드시 출처([1],[2]...)를 붙이세요.
-
-[작성 절차]
-1) 관련 근거를 5~15개 추출 (요약 + 출처)
-2) 필수(의무) / 권고(운영) 구분
-3) 체크리스트 작성
-
-[출력 형식]
-## 0) 근거 목록
-- ... [출처]
-
-## 1) 필수 요구사항 체크리스트
-- [ ] ... [출처]
-
-## 2) 권고 체크리스트
-- [ ] ... [출처]
-
-## 3) 근거 부족 / 추가 확인 질문
-- ...
-"""
-
 
     # =========================================================
-    #  3. OFFICIAL LETTER (공문 특화 - 법령 QA 고도화)
+    #  2. OFFICIAL LETTER (공문 특화 - 법령 QA 고도화)
     # =========================================================
     if report_type == "official_letter":
         return f"""[역할]
@@ -236,6 +200,11 @@ def build_user_prompt(
 끝.
 
 """
+
+
+ # =========================================================
+    #  3. DOC_DRAFT (문서 생성형)
+    # =========================================================
 
     if report_type == "doc_draft":
         return f"""[역할]
@@ -489,11 +458,6 @@ def build_user_prompt(
 
 
 """
-
-
-
-
-
 # -----------------------------
 # Tokenize / Normalize helpers
 # -----------------------------
@@ -519,6 +483,27 @@ def minmax_norm(arr: np.ndarray) -> np.ndarray:
 # -----------------------------
 # Config
 # -----------------------------
+
+
+@dataclass
+class OutputGuardConfig:
+    enabled: bool = True
+    mode: str = "repair"  # "mark" | "block" | "warn" | "repair"
+    # 공통 금지 패턴
+    ban_patterns: List[str] = field(default_factory=lambda: [
+        r"\b\d{4}년\s*\d{1,2}월\s*\d{1,2}일\b",   # 날짜
+        r"제\s*\d+\s*조",                         # 조문
+        r"(징역|벌금|과태료|과징금)",              # 제재 키워드/금액 단정 유발
+        r"\b\d+\s*원\b",                          # 원 단위 금액
+        r"\b\d+\s*만원\b",                        # 만원 단위 금액
+        r"\b\d+\s*억원\b",                        # 억원 단위 금액
+    ])
+    # doc_draft에서 추가로 더 민감한 것
+    doc_draft_extra: List[str] = field(default_factory=lambda: [
+        r"\b\d+\s*층\b",                          # 층수 자동 생성 방지
+        r"\b높이\s*\d+(\.\d+)?\s*m\b",            # 높이 자동 생성 방지
+    ])
+
 @dataclass
 class RAGConfig:
     # Paths
@@ -540,7 +525,7 @@ class RAGConfig:
     chat_format: str = "llama-3"
     n_ctx: int = 8192
     max_tokens: int = 4096
-    temperature: float = 0.2
+    temperature: float = 0.1
     top_p: float = 0.95
     n_gpu_layers: int = -1   # -1이면 가능한 만큼 GPU offload
     n_threads: int = 0       # 0이면 llama.cpp 기본값
@@ -552,7 +537,140 @@ class RAGConfig:
 
     # Prompt / Report
     prompt_mode: str = "prod"   # prod|eval
-    report_type: str = "doc_draft"  # review_report|official_letter|qa_short|checklist
+    report_type: str = "doc_draft"  # review_report|official_letter|qa_short|
+
+    reset_kv_each_query: bool = True
+    output_guard: "OutputGuardConfig" = field(default_factory=lambda: OutputGuardConfig(enabled=True, mode="repair")) # 강하게 막으려면 block 옵션, 표시만 할거면 mark
+
+
+def reset_kv_cache_if_supported(llm: Any) -> bool:
+    """llama-cpp-python Llama 객체가 reset()을 지원하면 KV cache 초기화."""
+    try:
+        if hasattr(llm, "reset") and callable(getattr(llm, "reset")):
+            llm.reset()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def validate_output_text(
+    text: str,
+    report_type: str,
+    guard: OutputGuardConfig,
+    allow_text: str = "",
+) -> Tuple[str, List[str]]:
+    """출력 안전검증: 날짜/조문/제재/금액 등 금지 패턴이 나오면 mark/block/warn 처리."""
+    if not guard.enabled:
+        return text, []
+
+    patterns = list(guard.ban_patterns)
+    if report_type == "doc_draft":
+        patterns += guard.doc_draft_extra
+
+    hits: List[str] = []
+    for pat in patterns:
+        if re.search(pat, text):
+            hits.append(pat)
+
+    if not hits:
+        return text, []
+
+    if guard.mode == "warn":
+        return text, hits
+
+    if guard.mode == "mark":
+        warn_block = "\n\n---\n## [자동 검증 경고]\n"
+        warn_block += "- 금지 패턴이 탐지되어 일부 내용은 환각/임의생성 가능성이 있습니다.\n"
+        warn_block += "- 해당 항목은 '[현장 입력 필요]' 또는 '[근거 부족]'으로 처리하는 것을 권장합니다.\n"
+        for h in hits:
+            warn_block += f"  - detected_pattern: `{h}`\n"
+        return text + warn_block, hits
+
+    if guard.mode == "block":
+        blocked = (
+            "출력 검증에서 금지 패턴이 탐지되어 결과를 차단했습니다.\n"
+            "날짜/조문/제재/금액 등은 컨텍스트 또는 사용자 입력에 실제로 존재할 때만 포함될 수 있습니다.\n"
+            f"- detected_patterns: {hits}\n"
+        )
+        return blocked, hits
+    
+    if guard.mode == "repair":
+        fixed = text
+        allow_text = allow_text or ""
+
+        # -----------------------
+        # allowlist 추출 (질의+컨텍스트에 "실제로 등장한 값"만 허용)
+        # -----------------------
+        date_pat = r"\b\d{4}년\s*\d{1,2}월\s*\d{1,2}일\b"
+        floor_pat = r"\b\d+\s*층\b"
+        height_pat = r"\b높이\s*\d+(\.\d+)?\s*m\b"
+        money_pat = r"\b\d+\s*(원|만원|억원)\b"
+        article_pat = r"제\s*\d+\s*조"
+
+        allow_dates = set(m.group(0) for m in re.finditer(date_pat, allow_text))
+        allow_floors = set(m.group(0) for m in re.finditer(floor_pat, allow_text))
+        allow_heights = set(m.group(0) for m in re.finditer(height_pat, allow_text))
+        allow_moneys = set(m.group(0) for m in re.finditer(money_pat, allow_text))
+        allow_articles = set(m.group(0) for m in re.finditer(article_pat, allow_text))
+
+        # -----------------------
+        # 1) 날짜: allowlist에 없는 날짜만 치환
+        # -----------------------
+        def _rep_date(m: re.Match) -> str:
+            s = m.group(0)
+            return s if s in allow_dates else "[현장 입력 필요]"
+
+        fixed = re.sub(date_pat, _rep_date, fixed)
+
+        # -----------------------
+        # 2) doc_draft: 층/높이도 allowlist에 없는 값만 치환
+        # -----------------------
+        if report_type == "doc_draft":
+            def _rep_floor(m: re.Match) -> str:
+                s = m.group(0)
+                return s if s in allow_floors else "[현장 입력 필요]"
+
+            def _rep_height(m: re.Match) -> str:
+                s = m.group(0)
+                return s if s in allow_heights else "[현장 입력 필요]"
+
+            fixed = re.sub(floor_pat, _rep_floor, fixed)
+            fixed = re.sub(height_pat, _rep_height, fixed)
+
+        # -----------------------
+        # 3) 조문/금액: allowlist에 없으면 '근거 부족' 유도
+        #    - 문장 전체 삭제는 너무 공격적이라, "표현"만 완화/대체
+        # -----------------------
+        def _rep_article(m: re.Match) -> str:
+            s = m.group(0)
+            return s if s in allow_articles else "[근거 부족: 조문번호는 컨텍스트/질의에 원문으로 존재할 때만 기재]"
+
+        fixed = re.sub(article_pat, _rep_article, fixed)
+
+        def _rep_money(m: re.Match) -> str:
+            s = m.group(0)
+            return s if s in allow_moneys else "[근거 부족: 금액은 컨텍스트/질의에 존재할 때만 기재]"
+
+        fixed = re.sub(money_pat, _rep_money, fixed)
+
+        # 4) 제재 키워드(징역/벌금/과태료/과징금):
+        #    - 키워드는 유지할 수도 있지만, 대부분 수치/조문이 붙으면서 환각이 발생하니
+        #      allowlist(조문/금액) 없이 등장하면 '근거 부족' 문구를 추가하는 방식으로 완화
+        sanc_kw_pat = r"(징역|벌금|과태료|과징금)"
+        if re.search(sanc_kw_pat, fixed):
+            # 조문/금액이 허용된 상태가 아니면, 안내 문구를 덧붙임
+            # (문장 삭제/차단 대신 “확정 불가”로 정정)
+            if not allow_articles and not allow_moneys:
+                fixed += "\n\n[근거 부족: 제재(형사/과태료/금액)는 법령 원문/조문/수치가 컨텍스트에 있을 때만 확정 가능]"
+
+        warn_block = "\n\n---\n## [자동 정정 안내]\n"
+        warn_block += "- 출력에 '입력(질의/컨텍스트)에 없는' 날짜·층수·높이·조문·금액 표현이 탐지되어 자동으로 대체했습니다.\n"
+        for h in hits:
+            warn_block += f"  - detected_pattern: `{h}`\n"
+
+        return fixed + warn_block, hits
+
 
 def get_retriever_signature(cfg: "RAGConfig") -> str:
     # “지표가 바뀌는 원인”이 되는 요소만 담기 (경로는 넣지 않기)
@@ -819,7 +937,11 @@ def llama_chat(
     max_tokens: int,
     temperature: float,
     top_p: float = 0.95,
+    *,
+    reset_kv: bool = False,
 ) -> str:
+    if reset_kv:
+        reset_kv_cache_if_supported(llm)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -880,7 +1002,17 @@ def generate(resources: RAGResources, query: str, retrieved, system_prompt: Opti
         max_tokens=cfg.max_tokens,
         temperature=cfg.temperature,
         top_p=cfg.top_p,
+        reset_kv=bool(getattr(cfg, "reset_kv_each_query", True)),
     )
+    guard = getattr(cfg, "output_guard", None)
+    if guard is not None:
+        allow_text = f"{query}\n\n{ctx}"
+        answer, _hits = validate_output_text(
+            answer,
+            getattr(cfg, "report_type", "review_report"),
+            guard,
+            allow_text=allow_text,
+        )
     return answer, ctx, user_prompt
 
 

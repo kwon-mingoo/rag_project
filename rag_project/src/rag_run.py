@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         "--report",
         type=str,
         default="doc_draft",
-        choices=["review_report", "official_letter", "checklist", "qa_short", "doc_draft"],
+        choices=["review_report", "official_letter", "qa_short", "doc_draft"],
         help="출력 문서 형식 선택",
     )
     p.add_argument(
@@ -89,7 +89,7 @@ def main():
     print("[QUERY]")
     print(args.query)
 
-    # ✅ 통합 엔진 단일 진입점
+    # 통합 엔진 단일 진입점
     # retrieve → make_context_blocks → build_user_prompt(report_type/prompt_mode) → generate
     answer, retrieved, context_blocks, user_prompt = eng.answer_query(res, args.query)
 

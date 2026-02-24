@@ -506,6 +506,7 @@ def main():
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=1.0,
+            reset_kv=True,
         )
 
     rows_out: List[Dict[str, Any]] = []
